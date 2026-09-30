@@ -1,4 +1,72 @@
-Coroot Cluster Agent.
+# Shards Cluster Agent
+
+A fork of [coroot-cluster-agent](https://github.com/coroot/coroot-cluster-agent): one agent per cluster (or per
+Docker Compose host group) that monitors databases, message brokers, search engines and managed cloud services,
+and pushes everything to Coroot over Prometheus remote write. Nothing has to be installed next to the monitored
+services: the agent connects to them over the network.
+
+## What you can monitor
+
+| Area | Targets | What you get |
+|---|---|---|
+| Relational databases | PostgreSQL, MySQL / MariaDB, PgBouncer | Availability, connections, top queries (obfuscated), wait events, locks, replication lag (both sides, incl. logical replication), `pg_stat_database` / `pg_stat_io` / WAL stats, unused and duplicate indexes, table sizes and bloat, schema and settings change tracking (secrets redacted), pools and client wait time for PgBouncer — see [docs/postgres-mysql-metrics.md](docs/postgres-mysql-metrics.md) |
+| Key-value stores | Redis / Valkey, Memcached | Upstream exporters embedded as libraries |
+| Document stores | MongoDB | Server status, replication, current ops, profiler top queries |
+| Message brokers | Kafka and Kafka-compatible (Redpanda, Amazon MSK), RabbitMQ | Kafka: brokers, controller, topics, under-replicated/offline partitions, consumer group lag and state. RabbitMQ: its native Prometheus endpoint |
+| Analytics / search | ClickHouse, Elasticsearch, OpenSearch | ClickHouse: queries, merges, parts, replication queues, stuck mutations, errors, top queries from `query_log`. Elasticsearch/OpenSearch: cluster health, node JVM/GC/disk/thread pools/breakers, per-index docs and size |
+| Coordination | etcd | Its native Prometheus endpoint |
+| Kubernetes | kube-state-metrics (built in), events, pods annotated with `coroot.com/scrape-metrics` | Cluster object state, events as logs, custom application metrics |
+| AWS | RDS / Aurora, ElastiCache (incl. Serverless), MemoryDB | Discovery by tags, Enhanced Monitoring OS metrics, RDS logs, Aurora replica lag and Serverless ACU via CloudWatch; discovered instances are monitored as databases automatically |
+| Google Cloud | Cloud SQL, Memorystore | Discovery, system metrics, logs |
+| Oracle Cloud | MySQL HeatWave, PostgreSQL, OCI Cache | Discovery, system metrics, logs |
+| Azure | PostgreSQL / MySQL Flexible Server, Azure Cache for Redis | Discovery by tags, Azure Monitor metrics (CPU, memory, storage, IOPS, connections, replica lag) |
+
+The agent also profiles pods (CPU and memory profiles) and collects Kubernetes events.
+
+## How targets are discovered
+
+- **Kubernetes**: annotate a pod, e.g. `coroot.com/postgres-scrape: "true"` (plus `-port`, credentials and TLS secret
+  annotations). The same pattern works for `mysql`, `redis`, `mongodb`, `memcached`, `kafka`, `clickhouse`,
+  `elasticsearch`, `pgbouncer`, `rabbitmq` and `etcd`.
+- **Docker Compose / VMs**: list the targets in a static configuration file passed with `--config-file`.
+  Environment variables in the file are expanded, so passwords can stay out of it:
+
+```yaml
+databases:
+  - type: postgres
+    host: postgres
+    port: "5432"
+    credentials: {username: coroot, password: ${PG_PASSWORD}}
+  - type: kafka
+    host: kafka-1
+    port: "9092"
+  - type: clickhouse
+    host: clickhouse
+    port: "9000"
+  - type: elasticsearch
+    host: elasticsearch
+    port: "9200"
+    credentials: {username: coroot, password: ${ES_PASSWORD}}
+  - {type: postgres, rds: orders-db, credentials: {username: coroot, password: "${PG_PASSWORD}"}}  # discovered cloud instances are referenced by name
+```
+
+- **Cloud**: configure AWS / GCP / OCI / Azure credentials and tag filters; discovered managed databases become
+  targets on their own (see [Cloud integrations](#cloud-integrations)).
+
+## Running it
+
+```sh
+coroot-cluster-agent --coroot-url=http://coroot:8080 --api-key=$API_KEY --config-file=/etc/coroot/agent.yaml
+```
+
+Operational endpoints: `/metrics` (including the agent's own metrics, e.g. per-target
+`coroot_cluster_agent_target_collect_{duration_seconds,success,timeouts_total}` and remote write queue metrics),
+`/healthz` and `/readyz`. pprof is off unless `--enable-pprof` is set. A slow or unreachable target never stalls the
+others: every target is collected in the background with its own deadline. SIGTERM flushes the remote write queue
+and logs before exiting (`--shutdown-timeout`).
+
+The sections below describe each integration in detail.
+
 ## Kafka
 
 The agent can monitor Apache Kafka clusters, as well as Kafka API compatible systems such as Redpanda

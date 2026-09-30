@@ -15,6 +15,8 @@ import (
 	"github.com/coroot/coroot-cluster-agent/common"
 	"github.com/coroot/coroot-cluster-agent/config"
 	"github.com/coroot/coroot-cluster-agent/k8s"
+	"github.com/coroot/coroot-cluster-agent/metrics/clickhouse"
+	"github.com/coroot/coroot-cluster-agent/metrics/elasticsearch"
 	"github.com/coroot/coroot-cluster-agent/metrics/kafka"
 	"github.com/coroot/coroot-cluster-agent/metrics/mongo"
 	"github.com/coroot/coroot-cluster-agent/metrics/mysql"
@@ -39,6 +41,10 @@ const (
 	TargetTypeMongodb   TargetType = "mongodb"
 	TargetTypeMemcached TargetType = "memcached"
 	TargetTypeKafka     TargetType = "kafka"
+
+	TargetTypeClickhouse    TargetType = "clickhouse"
+	TargetTypeElasticsearch TargetType = "elasticsearch"
+	TargetTypeOpensearch    TargetType = "opensearch" // an alias of elasticsearch: the same collector and metrics
 )
 
 type Credentials struct {
@@ -385,6 +391,22 @@ func (t *Target) newCollector(credentials Credentials, tlsCreds common.TLSCreden
 			return nil, nil, err
 		}
 		return collector, func() { _ = collector.Close() }, nil
+
+	case TargetTypeClickhouse:
+		collector, err := clickhouse.New(t.Addr, credentials.Username, credentials.Password, tlsCreds, t.Params,
+			scrapeInterval, collectTimeout, t.logger, excludeDatabases)
+		if err != nil {
+			return nil, nil, err
+		}
+		return collector, func() { _ = collector.Close() }, nil
+
+	case TargetTypeElasticsearch, TargetTypeOpensearch:
+		collector, err := elasticsearch.New(t.Addr, credentials.Username, credentials.Password, tlsCreds, t.Params,
+			scrapeInterval, collectTimeout, t.logger)
+		if err != nil {
+			return nil, nil, err
+		}
+		return collector, func() { _ = collector.Close() }, nil
 	}
 	return nil, nil, fmt.Errorf("unsupported target type: %s", t.Type)
 }
@@ -560,6 +582,14 @@ func TargetFromPod(pod *k8s.Pod) *Target {
 		}
 	}
 
+	if pod.Annotations["coroot.com/clickhouse-scrape"] == "true" {
+		t = targetFromPodAnnotations(pod, TargetTypeClickhouse, "9000", "protocol", "tls")
+	}
+
+	if pod.Annotations["coroot.com/elasticsearch-scrape"] == "true" {
+		t = targetFromPodAnnotations(pod, TargetTypeElasticsearch, "9200", "tls", "nodes")
+	}
+
 	if t != nil {
 		t.DiscoveredFromPodAnnotations = true
 		t.podKey = pod.Key()
@@ -567,6 +597,34 @@ func TargetFromPod(pod *k8s.Pod) *Target {
 		t.logger = logger.NewKlog(t.String())
 	}
 
+	return t
+}
+
+// targetFromPodAnnotations builds a target from the generic coroot.com/<type>-scrape-* annotations:
+// port, credentials (plain or from a secret), TLS secret and the given params (coroot.com/<type>-scrape-param-<name>).
+func targetFromPodAnnotations(pod *k8s.Pod, targetType TargetType, defaultPort string, params ...string) *Target {
+	prefix := "coroot.com/" + string(targetType) + "-scrape-"
+	t := &Target{
+		Type: targetType,
+		Addr: net.JoinHostPort(pod.IP, cmp.Or(pod.Annotations[prefix+"port"], defaultPort)),
+		Credentials: Credentials{
+			Username: pod.Annotations[prefix+"credentials-username"],
+			Password: pod.Annotations[prefix+"credentials-password"],
+		},
+		CredentialsSecret: CredentialsSecret{
+			Namespace:   pod.Id.Namespace,
+			Name:        pod.Annotations[prefix+"credentials-secret-name"],
+			UsernameKey: pod.Annotations[prefix+"credentials-secret-username-key"],
+			PasswordKey: pod.Annotations[prefix+"credentials-secret-password-key"],
+		},
+		TLSSecret: tlsSecretFromPod(pod, string(targetType)),
+		Params:    map[string]string{},
+	}
+	for _, p := range params {
+		if v := pod.Annotations[prefix+"param-"+p]; v != "" {
+			t.Params[p] = v
+		}
+	}
 	return t
 }
 

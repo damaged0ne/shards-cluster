@@ -1,0 +1,60 @@
+{
+  "cluster_name" : "docker-cluster",
+  "nodes" : {
+    "Qy5bM9ZkSvyVhHgqHjF1kQ" : {
+      "name" : "es01",
+      "host" : "172.18.0.2",
+      "indices" : {
+        "docs" : { "count" : 104233, "deleted" : 12 },
+        "store" : { "size_in_bytes" : 58237440, "total_data_set_size_in_bytes" : 58237440, "reserved_in_bytes" : 0 },
+        "indexing" : { "index_total" : 104300, "index_time_in_millis" : 23456, "index_current" : 0, "index_failed" : 3, "delete_total" : 0, "delete_time_in_millis" : 0, "noop_update_total" : 0, "is_throttled" : false, "throttle_time_in_millis" : 0, "write_load" : 0.0012 },
+        "search" : { "open_contexts" : 0, "query_total" : 5200, "query_time_in_millis" : 7800, "query_current" : 0, "fetch_total" : 5100, "fetch_time_in_millis" : 900, "fetch_current" : 0, "scroll_total" : 0, "scroll_time_in_millis" : 0, "scroll_current" : 0, "suggest_total" : 0, "suggest_time_in_millis" : 0, "suggest_current" : 0 },
+        "merges" : { "current" : 0, "current_docs" : 0, "current_size_in_bytes" : 0, "total" : 40, "total_time_in_millis" : 5000, "total_docs" : 90000, "total_size_in_bytes" : 40000000, "total_stopped_time_in_millis" : 0, "total_throttled_time_in_millis" : 0, "total_auto_throttle_in_bytes" : 251658240 },
+        "refresh" : { "total" : 800, "total_time_in_millis" : 12000, "external_total" : 700, "external_total_time_in_millis" : 11000, "listeners" : 0 },
+        "flush" : { "total" : 30, "periodic" : 10, "total_time_in_millis" : 1500, "total_time_excluding_waiting_on_lock_in_millis" : 1400 },
+        "segments" : { "count" : 55, "memory_in_bytes" : 0 }
+      },
+      "process" : {
+        "timestamp" : 1727700000000,
+        "open_file_descriptors" : 420,
+        "max_file_descriptors" : 1048576,
+        "cpu" : { "percent" : 7, "total_in_millis" : 1234560 },
+        "mem" : { "total_virtual_in_bytes" : 7000000000 }
+      },
+      "jvm" : {
+        "timestamp" : 1727700000000,
+        "uptime_in_millis" : 3600000,
+        "mem" : {
+          "heap_used_in_bytes" : 536870912,
+          "heap_used_percent" : 50,
+          "heap_committed_in_bytes" : 1073741824,
+          "heap_max_in_bytes" : 1073741824,
+          "non_heap_used_in_bytes" : 180000000,
+          "non_heap_committed_in_bytes" : 190000000,
+          "pools" : { "young" : { "used_in_bytes" : 100 } }
+        },
+        "threads" : { "count" : 80, "peak_count" : 85 },
+        "gc" : {
+          "collectors" : {
+            "young" : { "collection_count" : 120, "collection_time_in_millis" : 3400 },
+            "G1 Concurrent GC" : { "collection_count" : 4, "collection_time_in_millis" : 20 },
+            "old" : { "collection_count" : 2, "collection_time_in_millis" : 500 }
+          }
+        }
+      },
+      "thread_pool" : {
+        "search" : { "threads" : 13, "queue" : 2, "active" : 1, "rejected" : 5, "largest" : 13, "completed" : 5000 },
+        "write" : { "threads" : 8, "queue" : 0, "active" : 0, "rejected" : 0, "largest" : 8, "completed" : 900 }
+      },
+      "fs" : {
+        "timestamp" : 1727700000000,
+        "total" : { "total_in_bytes" : 100000000000, "free_in_bytes" : 60000000000, "available_in_bytes" : 55000000000 },
+        "data" : [ { "path" : "/usr/share/elasticsearch/data", "mount" : "/ (overlay)", "type" : "overlay", "total_in_bytes" : 100000000000, "free_in_bytes" : 60000000000, "available_in_bytes" : 55000000000 } ]
+      },
+      "breakers" : {
+        "request" : { "limit_size_in_bytes" : 644245094, "limit_size" : "614.3mb", "estimated_size_in_bytes" : 0, "estimated_size" : "0b", "overhead" : 1.0, "tripped" : 0 },
+        "parent" : { "limit_size_in_bytes" : 1020054732, "limit_size" : "972.7mb", "estimated_size_in_bytes" : 540000000, "estimated_size" : "515mb", "overhead" : 1.0, "tripped" : 2 }
+      }
+    }
+  }
+}

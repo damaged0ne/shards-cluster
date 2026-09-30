@@ -1,0 +1,45 @@
+{
+  "cluster_name" : "opensearch-cluster",
+  "nodes" : {
+    "aB3dE5fGh7iJk9lMn1oPqA" : {
+      "name" : "opensearch-node1",
+      "host" : "172.19.0.3",
+      "indices" : {
+        "docs" : { "count" : 2000, "deleted" : 1 },
+        "store" : { "size_in_bytes" : 3000000, "reserved_in_bytes" : 0 },
+        "indexing" : { "index_total" : 2100, "index_time_in_millis" : 800, "index_current" : 0, "index_failed" : 0, "delete_total" : 0, "delete_time_in_millis" : 0, "noop_update_total" : 0, "is_throttled" : false, "throttle_time_in_millis" : 0, "doc_status" : {} },
+        "search" : { "open_contexts" : 0, "query_total" : 300, "query_time_in_millis" : 450, "query_current" : 0, "concurrent_query_total" : 0, "fetch_total" : 290, "fetch_time_in_millis" : 30, "fetch_current" : 0, "scroll_total" : 0, "scroll_time_in_millis" : 0, "scroll_current" : 0, "point_in_time_total" : 0, "suggest_total" : 0, "suggest_time_in_millis" : 0, "suggest_current" : 0, "request" : {} },
+        "merges" : { "current" : 0, "total" : 4, "total_time_in_millis" : 120, "total_docs" : 1000, "total_size_in_bytes" : 1000000, "total_stopped_time_in_millis" : 0, "total_throttled_time_in_millis" : 0, "total_auto_throttle_in_bytes" : 20971520 },
+        "refresh" : { "total" : 60, "total_time_in_millis" : 900, "external_total" : 50, "external_total_time_in_millis" : 850, "listeners" : 0 },
+        "flush" : { "total" : 8, "periodic" : 0, "total_time_in_millis" : 40 },
+        "segments" : { "count" : 12, "memory_in_bytes" : 0, "remote_store" : {}, "segment_replication" : {} }
+      },
+      "process" : { "timestamp" : 1727700000000, "open_file_descriptors" : 300, "max_file_descriptors" : 65536, "cpu" : { "percent" : 3, "total_in_millis" : 91000 }, "mem" : { "total_virtual_in_bytes" : 6000000000 } },
+      "jvm" : {
+        "timestamp" : 1727700000000,
+        "uptime_in_millis" : 7200000,
+        "mem" : { "heap_used_in_bytes" : 268435456, "heap_used_percent" : 50, "heap_committed_in_bytes" : 536870912, "heap_max_in_bytes" : 536870912, "non_heap_used_in_bytes" : 150000000, "non_heap_committed_in_bytes" : 160000000, "pools" : {} },
+        "gc" : { "collectors" : { "young" : { "collection_count" : 30, "collection_time_in_millis" : 600 }, "old" : { "collection_count" : 0, "collection_time_in_millis" : 0 } } }
+      },
+      "thread_pool" : {
+        "search" : { "threads" : 7, "queue" : 0, "active" : 0, "rejected" : 1, "largest" : 7, "completed" : 400, "total_wait_time_in_nanos" : 0 },
+        "write" : { "threads" : 4, "queue" : 0, "active" : 0, "rejected" : 0, "largest" : 4, "completed" : 80 }
+      },
+      "fs" : {
+        "timestamp" : 1727700000000,
+        "total" : { "total_in_bytes" : 50000000000, "free_in_bytes" : 30000000000, "available_in_bytes" : 28000000000, "cache_reserved_in_bytes" : 0 },
+        "data" : [ { "path" : "/usr/share/opensearch/data/nodes/0", "mount" : "/ (overlay)", "type" : "overlay", "total_in_bytes" : 50000000000, "free_in_bytes" : 30000000000, "available_in_bytes" : 28000000000, "cache_reserved_in_bytes" : 0 } ]
+      },
+      "breakers" : {
+        "request" : { "limit_size_in_bytes" : 322122547, "limit_size" : "307.1mb", "estimated_size_in_bytes" : 0, "estimated_size" : "0b", "overhead" : 1.0, "tripped" : 0 },
+        "parent" : { "limit_size_in_bytes" : 510027366, "limit_size" : "486.3mb", "estimated_size_in_bytes" : 270000000, "estimated_size" : "257.4mb", "overhead" : 1.0, "tripped" : 0 }
+      }
+    },
+    "zY9xW7vUt5sRq3pOn1mLkQ" : {
+      "name" : "opensearch-node2",
+      "host" : "172.19.0.4",
+      "indices" : { "docs" : { "count" : 1900, "deleted" : 0 }, "store" : { "size_in_bytes" : 2900000 } },
+      "jvm" : { "mem" : { "heap_used_in_bytes" : 200000000, "heap_max_in_bytes" : 536870912, "heap_committed_in_bytes" : 536870912, "non_heap_used_in_bytes" : 140000000, "non_heap_committed_in_bytes" : 150000000 }, "gc" : { "collectors" : { "young" : { "collection_count" : 25, "collection_time_in_millis" : 500 } } } }
+    }
+  }
+}

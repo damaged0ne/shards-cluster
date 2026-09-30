@@ -1,0 +1,6 @@
+[
+  {"index":"logs-2024.09.30","health":"yellow","status":"open","pri":"1","rep":"1","docs.count":"100000","docs.deleted":"12","store.size":"52000000","pri.store.size":"52000000"},
+  {"index":"orders","health":"green","status":"open","pri":"3","rep":"0","docs.count":"4233","docs.deleted":"0","store.size":"6000000","pri.store.size":"6000000"},
+  {"index":".security-7","health":"green","status":"open","pri":"1","rep":"0","docs.count":"7","docs.deleted":"0","store.size":"50000","pri.store.size":"50000"},
+  {"index":"archived","health":"red","status":"close","pri":"1","rep":"1","docs.count":null,"docs.deleted":null,"store.size":null,"pri.store.size":null}
+]

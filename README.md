@@ -90,3 +90,135 @@ With `perPartitionMetrics: "true"`: `kafka_topic_partition_current_offset`, `kaf
 The user needs the `Describe` permission on the cluster, the topics and the consumer groups.
 The cluster is queried in the background every scrape interval, with the target's collect deadline (the scrape timeout minus 1s)
 for all requests; `/metrics` serves the latest snapshot and never waits for the cluster.
+
+
+## ClickHouse and Elasticsearch/OpenSearch targets
+
+The agent can monitor ClickHouse servers and Elasticsearch/OpenSearch clusters. Both are configured like the
+other database targets: in the static configuration file (`--config-file`, the main path for Docker Compose
+deployments) or with pod annotations in Kubernetes. Metrics are collected in the background every scrape interval
+(each snapshot is bounded by the target deadline, i.e. the scrape timeout minus 1s), and scrapes serve the last
+snapshot, so a slow or unavailable server never delays the metrics of other targets.
+
+### Static configuration
+
+```yaml
+databases:
+  - type: clickhouse
+    host: clickhouse          # resolved to IPs; one target per address
+    port: "9000"              # native protocol; use 8123 with protocol: http
+    credentials:
+      username: monitoring    # "default" if empty
+      password: ${CLICKHOUSE_PASSWORD}   # environment variables are expanded
+    params:
+      protocol: native        # native (default) or http
+      tls: "false"            # "true", "skip-verify" or "false"
+      # tlsCaFile: /etc/coroot/clickhouse-ca.pem   # PEM files: CA (chain verified, hostname not checked), client cert/key
+      # tlsCertFile: /etc/coroot/client.pem
+      # tlsKeyFile: /etc/coroot/client-key.pem
+      tablesExclude: '^system\.'  # regexes matched against "database.table" (also tablesInclude)
+      topTables: "100"        # max tables with per-table metrics (the largest ones)
+      queryLog: "true"        # top queries from system.query_log; "false" disables
+      topQueries: "20"
+
+  - type: elasticsearch       # or "opensearch": the same collector and metrics
+    host: es
+    port: "9200"
+    credentials:              # basic auth, optional
+      username: monitoring
+      password: ${ES_PASSWORD}
+    params:
+      tls: "true"             # https; "skip-verify" disables certificate verification
+      tlsCaFile: /etc/coroot/es-ca.pem
+      nodes: _local           # node stats of the node at the address (default) or "_all"
+      indicesExclude: '^\.'   # default: hidden and system indices; set to "" to include them (also indicesInclude)
+      topIndices: "100"       # max indices with per-index metrics (the largest ones)
+```
+
+All params are optional and must be strings (quote `"true"` and numbers). As hosts are resolved to IP addresses,
+`tls: "true"` without `tlsCaFile` only works with certificates issued for the IP; use `tlsCaFile` (verifies the
+chain against the CA without the hostname check) or `skip-verify`.
+
+### Kubernetes pod annotations
+
+```yaml
+coroot.com/clickhouse-scrape: "true"
+coroot.com/clickhouse-scrape-port: "9000"
+coroot.com/clickhouse-scrape-credentials-secret-name: clickhouse-monitoring
+coroot.com/clickhouse-scrape-credentials-secret-username-key: username
+coroot.com/clickhouse-scrape-credentials-secret-password-key: password
+coroot.com/clickhouse-scrape-param-protocol: native
+coroot.com/clickhouse-scrape-param-tls: "true"
+coroot.com/clickhouse-scrape-tls-secret-name: clickhouse-tls   # plus -tls-secret-ca-key/-cert-key/-key-key as for other targets
+
+coroot.com/elasticsearch-scrape: "true"
+coroot.com/elasticsearch-scrape-port: "9200"
+coroot.com/elasticsearch-scrape-credentials-username: monitoring
+coroot.com/elasticsearch-scrape-credentials-password: changeme
+coroot.com/elasticsearch-scrape-param-tls: skip-verify
+coroot.com/elasticsearch-scrape-param-nodes: _local
+```
+
+### Required privileges
+
+- ClickHouse: `SELECT` on `system.metrics`, `system.events`, `system.asynchronous_metrics`, `system.parts`,
+  `system.replicas`, `system.mutations`, `system.errors` and `system.query_log`
+  (e.g. `GRANT SELECT ON system.* TO monitoring`). A failing table is reported as a warning; the rest is still collected.
+- Elasticsearch/OpenSearch: the `monitor` cluster privilege and `monitor` on the indices to report.
+
+### Metrics
+
+Every target reports `<prefix>_up` and `<prefix>_scrape_error{error, warning}`, where `error` is the reason the
+server is unavailable and `warning` is `"<what>: <reason>"` for a failed query/request. Reasons are a small fixed
+set (`auth`, `permission`, `not_found`, `timeout`, `connection`, `tls`, `resource_limit`, `server_error`,
+`bad_response`, `unknown`); the full errors are logged (credentials are never logged).
+
+ClickHouse (`clickhouse_`):
+- `clickhouse_info{server_version}`
+- from `system.metrics`: `queries_running`, `merges_running`, `mutations_running`, `replicated_fetches_running`,
+  `replicated_sends_running`, `connections{protocol}`, `memory_tracking_bytes`, `inserts_delayed`, `readonly_replicas`,
+  `zookeeper_sessions`, `zookeeper_watches`, `zookeeper_requests_in_flight`, `background_merges_mutations_tasks`,
+  `background_fetches_tasks`, `parts_by_state{state}`, `distributed_files_to_insert`
+- from `system.events`: `queries_total{kind}`, `failed_queries_total{kind}`, `query_time_seconds_total`,
+  `inserted_rows_total`, `inserted_bytes_total`, `selected_rows_total`, `selected_bytes_total`, `merges_total`,
+  `merged_rows_total`, `merge_time_seconds_total`, `delayed_inserts_total`, `delayed_inserts_time_seconds_total`,
+  `rejected_inserts_total`, `zookeeper_exceptions_total{type}`, `replicated_part_failed_fetches_total`,
+  `replicated_data_loss_total`, `distributed_connection_fail_try_total`, `query_memory_limit_exceeded_total`
+- from `system.asynchronous_metrics`: `uptime_seconds`, `max_part_count_for_partition`,
+  `replicas_max_absolute_delay_seconds`, `replicas_max_queue_size`, `replicas_sum_queue_size`, `mergetree_parts`,
+  `mergetree_rows`, `mergetree_bytes`, `databases`, `tables`, `memory_resident_bytes`, `os_memory_total_bytes`,
+  `os_memory_available_bytes`
+- per table `{db, table}` (bounded by `topTables`, the include/exclude regexes and `--exclude-databases`):
+  `table_parts`, `table_rows`, `table_size_bytes`, `table_partitions`, `table_max_parts_per_partition` (active parts);
+  `replica_readonly`, `replica_session_expired`, `replica_absolute_delay_seconds`, `replica_queue_size`,
+  `replica_inserts_in_queue`, `replica_merges_in_queue`; `table_mutations_in_progress`, `table_mutations_failing`,
+  `table_mutations_stuck` (unfinished for more than an hour)
+- `clickhouse_errors_total{name}` (the top 100 error names from `system.errors`)
+- top queries `{db, query}` from `system.query_log` (initial queries grouped by `normalized_query_hash`, the text
+  normalized with `normalizeQuery()` and obfuscated again by the agent; the agent's own queries are excluded):
+  `top_query_calls_per_second`, `top_query_time_per_second`, `top_query_read_rows_per_second`,
+  `top_query_read_bytes_per_second`, `top_query_errors_per_second`. The window lags 10s behind the current time
+  because `query_log` is flushed asynchronously.
+
+Elasticsearch/OpenSearch (`elasticsearch_`, names follow
+[elasticsearch_exporter](https://github.com/prometheus-community/elasticsearch_exporter) where possible):
+- `elasticsearch_clusterinfo_version_info{cluster, version, distribution}`
+- `_cluster/health` `{cluster}`: `cluster_health_status{color}`, `cluster_health_number_of_nodes`,
+  `cluster_health_number_of_data_nodes`, `cluster_health_active_primary_shards`, `cluster_health_active_shards`,
+  `cluster_health_relocating_shards`, `cluster_health_initializing_shards`, `cluster_health_unassigned_shards`,
+  `cluster_health_delayed_unassigned_shards`, `cluster_health_number_of_pending_tasks`,
+  `cluster_health_number_of_in_flight_fetch`, `cluster_health_task_max_waiting_in_queue_millis`, `cluster_health_timed_out`
+- `_nodes/<nodes>/stats` `{cluster, host, name}`: `jvm_memory_used_bytes{area}`, `jvm_memory_max_bytes{area}`,
+  `jvm_memory_committed_bytes{area}`, `jvm_gc_collection_seconds_count{gc}`, `jvm_gc_collection_seconds_sum{gc}`,
+  `filesystem_data_{available,free,size}_bytes{mount, path}`, `indices_docs`, `indices_docs_deleted`,
+  `indices_store_size_bytes`, `indices_segments_count`, `indices_indexing_index_total`,
+  `indices_indexing_index_time_seconds_total`, `indices_indexing_index_failed_total`, `indices_search_query_total`,
+  `indices_search_query_time_seconds`, `indices_search_fetch_total`, `indices_search_fetch_time_seconds`,
+  `indices_merges_total`, `indices_merges_total_time_seconds_total`, `indices_refresh_total`,
+  `indices_refresh_time_seconds_total`, `indices_flush_total`, `indices_flush_time_seconds`,
+  `thread_pool_{rejected,active,queue,threads}_count{type}`, `breakers_tripped{breaker}`,
+  `breakers_estimated_size_bytes{breaker}`, `breakers_limit_size_bytes{breaker}`, `process_cpu_percent`,
+  `process_open_files_count`, `process_max_files_descriptors`
+- `_cat/indices` `{cluster, index}` (bounded by `topIndices` and the include/exclude regexes): `indices_docs_primary`,
+  `indices_deleted_docs_primary`, `indices_store_size_bytes_primary`, `indices_store_size_bytes_total`,
+  `indices_shards_primary`, `indices_replicas`, `indices_health_status{color}`

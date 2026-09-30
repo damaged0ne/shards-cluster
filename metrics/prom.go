@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
+	"slices"
 	"sync"
 
 	"github.com/prometheus/prometheus/config"
@@ -98,7 +100,16 @@ func (s *readyStorage) Appender(ctx context.Context) storage.Appender {
 	return notReadyAppender{}
 }
 
+func (s *readyStorage) AppenderV2(ctx context.Context) storage.AppenderV2 {
+	if x := s.get(); x != nil {
+		return x.AppenderV2(ctx)
+	}
+	return notReadyAppenderV2{}
+}
+
 type notReadyAppender struct{}
+
+func (n notReadyAppender) SetOptions(*storage.AppendOptions) {}
 
 func (n notReadyAppender) Append(ref storage.SeriesRef, l labels.Labels, t int64, v float64) (storage.SeriesRef, error) {
 	return 0, tsdb.ErrNotReady
@@ -112,7 +123,11 @@ func (n notReadyAppender) AppendHistogram(ref storage.SeriesRef, l labels.Labels
 	return 0, tsdb.ErrNotReady
 }
 
-func (n notReadyAppender) AppendCTZeroSample(ref storage.SeriesRef, l labels.Labels, t, ct int64) (storage.SeriesRef, error) {
+func (n notReadyAppender) AppendHistogramSTZeroSample(ref storage.SeriesRef, l labels.Labels, t, ct int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	return 0, tsdb.ErrNotReady
+}
+
+func (n notReadyAppender) AppendSTZeroSample(ref storage.SeriesRef, l labels.Labels, t, ct int64) (storage.SeriesRef, error) {
 	return 0, tsdb.ErrNotReady
 }
 
@@ -123,6 +138,16 @@ func (n notReadyAppender) UpdateMetadata(ref storage.SeriesRef, l labels.Labels,
 func (n notReadyAppender) Commit() error { return tsdb.ErrNotReady }
 
 func (n notReadyAppender) Rollback() error { return tsdb.ErrNotReady }
+
+type notReadyAppenderV2 struct{}
+
+func (n notReadyAppenderV2) Append(ref storage.SeriesRef, l labels.Labels, st, t int64, v float64, h *histogram.Histogram, fh *histogram.FloatHistogram, opts storage.AOptions) (storage.SeriesRef, error) {
+	return 0, tsdb.ErrNotReady
+}
+
+func (n notReadyAppenderV2) Commit() error { return tsdb.ErrNotReady }
+
+func (n notReadyAppenderV2) Rollback() error { return tsdb.ErrNotReady }
 
 func (s *readyStorage) Close() error {
 	if x := s.get(); x != nil {
@@ -211,9 +236,44 @@ func (rm *readyScrapeManager) Get() (*scrape.Manager, error) {
 	return nil, ErrNotReady
 }
 
-type Logger struct{}
+// slogHandler forwards the log records of the Prometheus components (scrape manager, remote write, WAL, ...)
+// to klog. Debug records are dropped, as the go-kit level filter did before the switch to slog.
+type slogHandler struct {
+	attrs []slog.Attr
+}
 
-func (l Logger) Log(v ...interface{}) error {
-	klog.Infoln(v...)
+func (slogHandler) Enabled(_ context.Context, l slog.Level) bool {
+	return l >= slog.LevelInfo
+}
+
+func (h slogHandler) Handle(_ context.Context, r slog.Record) error {
+	args := make([]interface{}, 0, (len(h.attrs)+r.NumAttrs())*2+1)
+	args = append(args, r.Message)
+	for _, a := range h.attrs {
+		args = append(args, a.Key, a.Value.Any())
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		args = append(args, a.Key, a.Value.Any())
+		return true
+	})
+	switch {
+	case r.Level >= slog.LevelError:
+		klog.Errorln(args...)
+	case r.Level >= slog.LevelWarn:
+		klog.Warningln(args...)
+	default:
+		klog.Infoln(args...)
+	}
 	return nil
+}
+
+func (h slogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return slogHandler{attrs: append(slices.Clip(h.attrs), attrs...)}
+}
+
+func (h slogHandler) WithGroup(string) slog.Handler { return h }
+
+// NewLogger returns a slog logger writing to klog, for the Prometheus libraries.
+func NewLogger() *slog.Logger {
+	return slog.New(slogHandler{})
 }

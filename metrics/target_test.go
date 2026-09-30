@@ -392,7 +392,14 @@ func TestK8sDiscoveryPodAnnotations(t *testing.T) {
 		"__meta_kubernetes_pod_phase":                                "Running",
 		model.SchemeLabel:                                            "http",
 	})
-	res, keep := relabel.Process(lbls, cfg.RelabelConfigs...)
+	for _, rc := range cfg.RelabelConfigs {
+		if err := rc.Validate(model.UTF8Validation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lb := labels.NewBuilder(lbls)
+	keep := relabel.ProcessBuilder(lb, cfg.RelabelConfigs...)
+	res := lb.Labels()
 	if !keep {
 		t.Fatal("the target must be kept")
 	}

@@ -28,8 +28,8 @@ type ReplConfig struct {
 	} `bson:"config"`
 }
 
-func (c *Collector) collectReplConfig(ctx context.Context) (*ReplConfig, error) {
-	res := c.client.Database("admin").RunCommand(ctx, bson.D{{Key: "replSetGetConfig", Value: 1}})
+func (c *Collector) collectReplConfig(ctx context.Context, client *mongo.Client) (*ReplConfig, error) {
+	res := client.Database("admin").RunCommand(ctx, bson.D{{Key: "replSetGetConfig", Value: 1}})
 	var cfg ReplConfig
 	if err := res.Decode(&cfg); err != nil {
 		var e mongo.CommandError
@@ -50,8 +50,8 @@ type OplogStats struct {
 	UsedSizeBytes float64
 }
 
-func (c *Collector) collectOplog(ctx context.Context) (*OplogStats, error) {
-	coll := c.client.Database("local").Collection("oplog.rs")
+func (c *Collector) collectOplog(ctx context.Context, client *mongo.Client) (*OplogStats, error) {
+	coll := client.Database("local").Collection("oplog.rs")
 
 	var first, last struct {
 		Ts primitive.Timestamp `bson:"ts"`

@@ -3,6 +3,7 @@ package oci
 import (
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/coroot/coroot-cluster-agent/common"
 	"github.com/coroot/coroot-cluster-agent/flags"
@@ -25,8 +26,15 @@ type cacheInfo struct {
 
 type CacheCollector struct {
 	discoverer *Discoverer
+	lock       sync.RWMutex // info is replaced by the discovery goroutine and read by Collect
 	info       cacheInfo
 	logs       *LogReader
+}
+
+func (c *CacheCollector) getInfo() cacheInfo {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return c.info
 }
 
 func (c *CacheCollector) Stop() {
@@ -38,7 +46,7 @@ func (c *CacheCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *CacheCollector) Collect(ch chan<- prometheus.Metric) {
-	i := c.info
+	i := c.getInfo()
 	ch <- common.Gauge(dCacheStatus, 1, i.state)
 	ch <- common.Gauge(dCacheInfo, 1,
 		i.name, i.compartment, i.region, i.host, i.port, i.engine, i.version, strconv.Itoa(i.nodeCount), strconv.FormatFloat(i.nodeMemoryGb, 'f', -1, 64),
@@ -58,7 +66,9 @@ func (d *Discoverer) discoverCaches() {
 	for _, compartment := range d.compartments {
 		res, err := d.listCaches(compartment)
 		if err != nil {
-			d.registerError(err) // reported with the discovery summary
+			if d.ctx.Err() == nil {
+				d.registerError(err) // reported with the discovery summary
+			}
 			failed = true
 		}
 		found = append(found, res...)
@@ -82,9 +92,11 @@ func (d *Discoverer) discoverCaches() {
 			}
 			d.cacheCollectors[info.id] = c
 		}
+		c.lock.Lock()
 		c.info = info
+		c.lock.Unlock()
 	}
-	if failed { // a compartment couldn't be listed: keep its collectors rather than dropping and re-adding them
+	if failed || d.ctx.Err() != nil { // a compartment couldn't be listed: keep its collectors rather than dropping and re-adding them
 		return
 	}
 	for id, c := range d.cacheCollectors {

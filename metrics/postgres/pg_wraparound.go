@@ -13,7 +13,7 @@ type wraparoundStats struct {
 	xminAgeByHolder map[string]float64
 }
 
-func (c *Collector) getWraparoundStats(ctx context.Context, version semver.Version) error {
+func (c *Collector) getWraparoundStats(ctx context.Context, version semver.Version, st *pgState) error {
 	ws := &wraparoundStats{
 		xidAge:          map[string]float64{},
 		multixactAge:    map[string]float64{},
@@ -21,7 +21,7 @@ func (c *Collector) getWraparoundStats(ctx context.Context, version semver.Versi
 	}
 	rows, err := c.db.QueryContext(ctx, `SELECT datname, age(datfrozenxid), mxid_age(datminmxid) FROM pg_database`)
 	if err != nil {
-		c.wraparound = nil
+		st.wraparound = nil
 		return err
 	}
 	defer rows.Close()
@@ -60,6 +60,6 @@ func (c *Collector) getWraparoundStats(ctx context.Context, version semver.Versi
 		}
 	}
 
-	c.wraparound = ws
+	st.wraparound = ws
 	return nil
 }

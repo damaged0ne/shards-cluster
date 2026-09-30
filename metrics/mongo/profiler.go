@@ -48,18 +48,18 @@ type profilerAgg struct {
 	calls, timeSeconds, docsReturned, docsExamined, keysExamined float64
 }
 
-func (c *Collector) collectProfiler(ctx context.Context) error {
+func (c *Collector) collectProfiler(ctx context.Context, client *mongo.Client) (map[string]int64, []TopQuery, error) {
 	var listResult struct {
 		Databases []struct {
 			Name string `bson:"name"`
 		} `bson:"databases"`
 	}
-	res := c.client.Database("admin").RunCommand(ctx, bson.D{
+	res := client.Database("admin").RunCommand(ctx, bson.D{
 		{Key: "listDatabases", Value: 1},
 		{Key: "nameOnly", Value: true},
 	})
 	if err := res.Decode(&listResult); err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	now := time.Now()
@@ -76,13 +76,13 @@ func (c *Collector) collectProfiler(ctx context.Context) error {
 		var status struct {
 			Was int64 `bson:"was"`
 		}
-		if err := c.client.Database(db.Name).RunCommand(ctx, bson.D{{Key: "profile", Value: -1}}).Decode(&status); err != nil {
+		if err := client.Database(db.Name).RunCommand(ctx, bson.D{{Key: "profile", Value: -1}}).Decode(&status); err != nil {
 			c.logger.Warning("profile status for", db.Name+":", err)
 		} else {
 			levels[db.Name] = status.Was
 		}
 
-		coll := c.client.Database(db.Name).Collection("system.profile")
+		coll := client.Database(db.Name).Collection("system.profile")
 
 		lastTs, seen := c.profilerLastTs[db.Name]
 		if !seen || firstRun {
@@ -112,14 +112,14 @@ func (c *Collector) collectProfiler(ctx context.Context) error {
 			if isNamespaceNotFound(err) {
 				continue // profiling is not enabled for this database
 			}
-			return err
+			return nil, nil, err
 		}
 		maxTs := lastTs
 		for cursor.Next(ctx) {
 			var doc profileDoc
 			if err = cursor.Decode(&doc); err != nil {
 				cursor.Close(ctx)
-				return err
+				return nil, nil, err
 			}
 			if doc.Ts.After(maxTs) {
 				maxTs = doc.Ts
@@ -152,15 +152,13 @@ func (c *Collector) collectProfiler(ctx context.Context) error {
 		err = cursor.Err()
 		cursor.Close(ctx)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 		c.profilerLastTs[db.Name] = maxTs
 	}
 
-	c.profilingLevels = levels
-
 	if elapsed <= 0 || firstRun {
-		return nil
+		return levels, nil, nil
 	}
 
 	c.profilerWindow = append(c.profilerWindow, profilerInterval{at: now, duration: elapsed, shapes: shapes})
@@ -206,8 +204,7 @@ func (c *Collector) collectProfiler(ctx context.Context) error {
 		}
 		return a.TimePerSecond > b.TimePerSecond
 	})
-	c.topQueries = top
-	return nil
+	return levels, top, nil
 }
 
 func (c *Collector) topQueriesMetrics(ch chan<- prometheus.Metric) {

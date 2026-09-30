@@ -3,6 +3,8 @@ package k8s
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 
 	"github.com/coroot/coroot-cluster-agent/flags"
 	corev1 "k8s.io/api/core/v1"
@@ -42,6 +44,14 @@ type K8S struct {
 	client *kubernetes.Clientset
 	stopCh chan struct{}
 
+	lock     sync.Mutex
+	factory  informers.SharedInformerFactory
+	stopped  bool
+	synced   atomic.Bool
+	stopOnce sync.Once
+
+	sendLock    sync.RWMutex // held for reading while sending to the subscribers, for writing while closing them
+	subsClosed  bool
 	subscribers []chan<- PodEvent
 }
 
@@ -72,20 +82,55 @@ func (k8s *K8S) Start() {
 	if k8s == nil {
 		return
 	}
-	go k8s.start()
+	k8s.lock.Lock()
+	defer k8s.lock.Unlock()
+	if k8s.stopped {
+		return
+	}
+	k8s.factory = k8s.start()
+	go func() {
+		for _, ok := range k8s.factory.WaitForCacheSync(k8s.stopCh) {
+			if !ok {
+				return
+			}
+		}
+		k8s.synced.Store(true)
+	}()
 }
 
+// Synced reports whether the informer caches have been synced (true if not running in k8s).
+func (k8s *K8S) Synced() bool {
+	if k8s == nil {
+		return true
+	}
+	return k8s.synced.Load()
+}
+
+// Stop stops the informers, waits for their event handlers to return, and only then closes
+// the subscriber channels, so no handler can send on a closed channel.
 func (k8s *K8S) Stop() {
 	if k8s == nil {
 		return
 	}
-	close(k8s.stopCh)
-	for _, s := range k8s.subscribers {
-		close(s)
-	}
+	k8s.stopOnce.Do(func() {
+		k8s.lock.Lock()
+		k8s.stopped = true
+		factory := k8s.factory
+		k8s.lock.Unlock()
+		close(k8s.stopCh) // also unblocks handlers blocked in sendPodEvent
+		if factory != nil {
+			factory.Shutdown()
+		}
+		k8s.sendLock.Lock()
+		defer k8s.sendLock.Unlock()
+		k8s.subsClosed = true
+		for _, s := range k8s.subscribers {
+			close(s)
+		}
+	})
 }
 
-func (k8s *K8S) start() {
+func (k8s *K8S) start() informers.SharedInformerFactory {
 	factory := informers.NewSharedInformerFactory(k8s.client, 0)
 
 	if !*flags.CollectKubernetesEvents {
@@ -123,33 +168,45 @@ func (k8s *K8S) start() {
 	if len(k8s.subscribers) > 0 {
 		pods := factory.Core().V1().Pods().Informer()
 		pods.AddEventHandler(cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj interface{}) {
-				pod := podFromObj(obj)
-				if pod == nil || !pod.Running() {
-					return
-				}
-				k8s.sendPodEvent(PodEvent{Type: PodEventTypeAdd, Pod: pod})
-			},
-			UpdateFunc: func(oldObj, newObj interface{}) {
-				pod := podFromObj(newObj)
-				old := podFromObj(oldObj)
-				if pod == nil || old == nil || !pod.Running() || pod.Equal(old) {
-					return
-				}
-				k8s.sendPodEvent(PodEvent{Type: PodEventTypeChange, Pod: pod, Old: old})
-			},
-			DeleteFunc: func(obj interface{}) {
-				pod := podFromObj(obj)
-				if pod == nil {
-					return
-				}
-				k8s.sendPodEvent(PodEvent{Type: PodEventTypeDelete, Pod: pod})
-			},
+			AddFunc:    k8s.onPodAdd,
+			UpdateFunc: k8s.onPodUpdate,
+			DeleteFunc: k8s.onPodDelete,
 		})
 	}
 
 	factory.Start(k8s.stopCh)
-	factory.WaitForCacheSync(k8s.stopCh)
+	return factory
+}
+
+func (k8s *K8S) onPodAdd(obj interface{}) {
+	pod := podFromObj(obj)
+	if pod == nil || !pod.Running() {
+		return
+	}
+	k8s.sendPodEvent(PodEvent{Type: PodEventTypeAdd, Pod: pod})
+}
+
+func (k8s *K8S) onPodUpdate(oldObj, newObj interface{}) {
+	pod := podFromObj(newObj)
+	old := podFromObj(oldObj)
+	if pod == nil || old == nil || pod.Equal(old) {
+		return
+	}
+	if !pod.Running() {
+		if old.Running() { // e.g. Running -> Failed/Succeeded (evicted, completed): the targets must be removed
+			k8s.sendPodEvent(PodEvent{Type: PodEventTypeDelete, Pod: old})
+		}
+		return
+	}
+	k8s.sendPodEvent(PodEvent{Type: PodEventTypeChange, Pod: pod, Old: old})
+}
+
+func (k8s *K8S) onPodDelete(obj interface{}) {
+	pod := podFromObj(obj)
+	if pod == nil {
+		return
+	}
+	k8s.sendPodEvent(PodEvent{Type: PodEventTypeDelete, Pod: pod})
 }
 
 func (k8s *K8S) SubscribeForPodEvents(l PodEventsListener) {
@@ -162,7 +219,16 @@ func (k8s *K8S) SubscribeForPodEvents(l PodEventsListener) {
 }
 
 func (k8s *K8S) sendPodEvent(e PodEvent) {
+	k8s.sendLock.RLock()
+	defer k8s.sendLock.RUnlock()
+	if k8s.subsClosed {
+		return
+	}
 	for _, s := range k8s.subscribers {
-		s <- e
+		select {
+		case s <- e:
+		case <-k8s.stopCh:
+			return
+		}
 	}
 }

@@ -21,11 +21,17 @@ type ErrorLogReader struct {
 	emitter *common.LogEmitter
 	ch      chan logparser.LogEntry
 	stop    chan struct{}
+	done    chan struct{}
 	logger  logger.Logger
 }
 
 func (c *Collector) StartErrorLog(serviceName, hostName string) {
+	c.errorLogLock.Lock()
+	defer c.errorLogLock.Unlock()
 	if c.errorLog != nil { // already started
+		return
+	}
+	if c.ctx.Err() != nil { // closed
 		return
 	}
 	emitter, err := common.NewLogEmitter(serviceName, hostName)
@@ -38,11 +44,13 @@ func (c *Collector) StartErrorLog(serviceName, hostName string) {
 		emitter: emitter,
 		ch:      make(chan logparser.LogEntry),
 		stop:    make(chan struct{}),
+		done:    make(chan struct{}),
 		logger:  c.logger,
 	}
 	r.parser = logparser.NewParser(r.ch, nil, emitter.Callback(), common.MultilineCollectorTimeout, common.LogPatternsPerLevel, false, nil)
 	c.errorLog = r
 	go func() {
+		defer close(r.done)
 		t := time.NewTicker(errorLogRefreshInterval)
 		defer t.Stop()
 		for {
@@ -59,14 +67,18 @@ func (c *Collector) StartErrorLog(serviceName, hostName string) {
 }
 
 func (c *Collector) ErrorLogCounters() []logparser.LogCounter {
-	if c.errorLog == nil {
+	c.errorLogLock.Lock()
+	r := c.errorLog
+	c.errorLogLock.Unlock()
+	if r == nil {
 		return nil
 	}
-	return c.errorLog.parser.GetCounters()
+	return r.parser.GetCounters()
 }
 
 func (r *ErrorLogReader) Stop() {
 	close(r.stop)
+	<-r.done
 	r.parser.Stop()
 	r.emitter.Stop()
 }

@@ -6,8 +6,8 @@ import (
 
 func msToSeconds(v float64) float64 { return v / 1000 }
 
-func (c *Collector) innodbMetrics(ch chan<- prometheus.Metric) {
-	s := c.globalStatus
+func (st *state) innodbMetrics(ch chan<- prometheus.Metric) {
+	s := st.globalStatus
 
 	metricFromVariable(ch, dInnodbBufferPoolReadRequests, "Innodb_buffer_pool_read_requests", prometheus.CounterValue, s)
 	metricFromVariable(ch, dInnodbBufferPoolReads, "Innodb_buffer_pool_reads", prometheus.CounterValue, s)
@@ -18,7 +18,7 @@ func (c *Collector) innodbMetrics(ch chan<- prometheus.Metric) {
 	metricFromVariable(ch, dInnodbBufferPoolPagesData, "Innodb_buffer_pool_pages_data", prometheus.GaugeValue, s)
 	metricFromVariable(ch, dInnodbBufferPoolWaitFree, "Innodb_buffer_pool_wait_free", prometheus.CounterValue, s)
 	metricFromVariable(ch, dInnodbBufferPoolPagesFlushed, "Innodb_buffer_pool_pages_flushed", prometheus.CounterValue, s)
-	metricFromVariable(ch, dInnodbPageSize, "innodb_page_size", prometheus.GaugeValue, c.globalVariables)
+	metricFromVariable(ch, dInnodbPageSize, "innodb_page_size", prometheus.GaugeValue, st.globalVariables)
 	metricFromVariable(ch, dInnodbRowsRead, "Innodb_rows_read", prometheus.CounterValue, s)
 	metricFromVariable(ch, dInnodbRowsInserted, "Innodb_rows_inserted", prometheus.CounterValue, s)
 	metricFromVariable(ch, dInnodbRowsUpdated, "Innodb_rows_updated", prometheus.CounterValue, s)

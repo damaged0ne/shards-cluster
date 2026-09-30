@@ -15,14 +15,13 @@ type innodbTrx struct {
 	byQuery map[string]float64 // obfuscated query shape -> max age (seconds)
 }
 
-func (c *Collector) innodbTrxSnapshot(ctx context.Context) {
+func (c *Collector) innodbTrxSnapshot(ctx context.Context, st *state) {
 	trx, err := c.queryInnodbTrx(ctx)
 	if err != nil {
-		c.logger.Warning(err)
-		c.scrapeErrors[err.Error()] = true
+		c.addScrapeError(st, err)
 		return
 	}
-	c.innodbTrx = trx
+	st.innodbTrx = trx
 }
 
 func (c *Collector) queryInnodbTrx(ctx context.Context) (*innodbTrx, error) {
@@ -48,7 +47,7 @@ func (c *Collector) queryInnodbTrx(ctx context.Context) (*innodbTrx, error) {
 		if age < minLongTransactionSeconds {
 			continue
 		}
-		label := obfuscate.Sql(query)
+		label := obfuscate.SqlWithDialect(query, obfuscate.DialectMySQL)
 		if label == "" {
 			label = "(idle in transaction)"
 		}
@@ -63,11 +62,11 @@ func (c *Collector) queryInnodbTrx(ctx context.Context) (*innodbTrx, error) {
 	return res, nil
 }
 
-func (c *Collector) innodbTrxMetrics(ch chan<- prometheus.Metric) {
-	if c.innodbTrx == nil {
+func (st *state) innodbTrxMetrics(ch chan<- prometheus.Metric) {
+	if st.innodbTrx == nil {
 		return
 	}
-	for query, age := range common.TopNMapByValue(c.innodbTrx.byQuery, topTransactionsN) {
+	for query, age := range common.TopNMapByValue(st.innodbTrx.byQuery, topTransactionsN) {
 		ch <- common.Gauge(dInnodbTransactionSeconds, age, query)
 	}
 }

@@ -13,7 +13,6 @@ import (
 type ssRow struct {
 	obfuscatedQueryText string
 	calls               sql.NullInt64
-	rows                sql.NullInt64
 	totalTime           sql.NullFloat64
 	ioTime              sql.NullFloat64
 }

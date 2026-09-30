@@ -15,29 +15,29 @@ func wsrepEnabled(variables map[string]string) bool {
 	return provider != "" && !strings.EqualFold(provider, "none")
 }
 
-func (c *Collector) galeraMetrics(ch chan<- prometheus.Metric) {
-	if !c.isGalera {
+func (st *state) galeraMetrics(ch chan<- prometheus.Metric) {
+	if !st.isGalera {
 		return
 	}
-	metricFromVariable(ch, dWsrepClusterSize, "wsrep_cluster_size", prometheus.GaugeValue, c.globalStatus)
-	if comment := c.globalStatus["wsrep_local_state_comment"]; comment != "" {
+	metricFromVariable(ch, dWsrepClusterSize, "wsrep_cluster_size", prometheus.GaugeValue, st.globalStatus)
+	if comment := st.globalStatus["wsrep_local_state_comment"]; comment != "" {
 		ch <- common.Gauge(dWsrepLocalState, 1, strings.ToLower(comment))
 	}
-	metricFromVariable(ch, dWsrepLocalRecvQueue, "wsrep_local_recv_queue", prometheus.GaugeValue, c.globalStatus)
-	metricFromVariable(ch, dWsrepLocalSendQueue, "wsrep_local_send_queue", prometheus.GaugeValue, c.globalStatus)
+	metricFromVariable(ch, dWsrepLocalRecvQueue, "wsrep_local_recv_queue", prometheus.GaugeValue, st.globalStatus)
+	metricFromVariable(ch, dWsrepLocalSendQueue, "wsrep_local_send_queue", prometheus.GaugeValue, st.globalStatus)
 
-	if v := c.globalStatus["wsrep_flow_control_paused_ns"]; v != "" {
+	if v := st.globalStatus["wsrep_flow_control_paused_ns"]; v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			ch <- common.Counter(dWsrepFlowControlPaused, f/nanoSeconds)
 		}
 	}
-	metricFromVariable(ch, dWsrepCertFailures, "wsrep_local_cert_failures", prometheus.CounterValue, c.globalStatus)
-	metricFromVariable(ch, dWsrepBfAborts, "wsrep_local_bf_aborts", prometheus.CounterValue, c.globalStatus)
+	metricFromVariable(ch, dWsrepCertFailures, "wsrep_local_cert_failures", prometheus.CounterValue, st.globalStatus)
+	metricFromVariable(ch, dWsrepBfAborts, "wsrep_local_bf_aborts", prometheus.CounterValue, st.globalStatus)
 
-	metricFromOnOff(ch, dWsrepReady, "wsrep_ready", c.globalStatus)
-	metricFromOnOff(ch, dWsrepConnected, "wsrep_connected", c.globalStatus)
+	metricFromOnOff(ch, dWsrepReady, "wsrep_ready", st.globalStatus)
+	metricFromOnOff(ch, dWsrepConnected, "wsrep_connected", st.globalStatus)
 
-	if status := c.globalStatus["wsrep_cluster_status"]; status != "" {
+	if status := st.globalStatus["wsrep_cluster_status"]; status != "" {
 		ch <- common.Gauge(dWsrepClusterStatus, 1, strings.ToLower(status))
 	}
 }

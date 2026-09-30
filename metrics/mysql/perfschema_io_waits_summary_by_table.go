@@ -68,17 +68,17 @@ type ioStatsWithKey struct {
 	s *ioStats
 }
 
-func (c *Collector) ioMetrics(ch chan<- prometheus.Metric, n int) {
-	if c.ioByTablePrev == nil || c.ioByTableCurr == nil {
+func (st *state) ioMetrics(ch chan<- prometheus.Metric, n int) {
+	if st.ioByTablePrev == nil || st.ioByTableCurr == nil {
 		return
 	}
 	res := map[ioTableKey]*ioStats{}
 
 	withKeys := make([]ioStatsWithKey, 0, len(res))
 
-	interval := c.ioByTableCurr.ts.Sub(c.ioByTablePrev.ts).Seconds()
-	for k, s := range c.ioByTableCurr.rows {
-		prev := c.ioByTablePrev.rows[k]
+	interval := st.ioByTableCurr.ts.Sub(st.ioByTablePrev.ts).Seconds()
+	for k, s := range st.ioByTableCurr.rows {
+		prev := st.ioByTablePrev.rows[k]
 		stats := &ioStats{}
 		if v := s.readTotalTime - prev.readTotalTime; v > 0 {
 			stats.readTimePerSecond = float64(v) / picoSeconds / interval

@@ -112,18 +112,11 @@ type ConnectionKey struct {
 	WaitEventType string
 }
 
-type Collector struct {
-	ctx           context.Context
-	ctxCancelFunc context.CancelFunc
-	done          chan struct{}
-
-	scrapeInterval time.Duration
-	collectTimeout time.Duration
-
-	db          *sql.DB
+// pgState is the result of a snapshot. Once published via Collector.state it is never
+// modified, so Collect can read it without holding the lock.
+type pgState struct {
 	origVersion string
 
-	statsDumpInterval time.Duration
 	ssCurr            *ssSnapshot
 	ssPrev            *ssSnapshot
 	saCurr            *saSnapshot
@@ -131,7 +124,6 @@ type Collector struct {
 	settings          []Setting
 	replicationStatus *replicationStatus
 
-	cpPrev           *checkpointStats
 	cpTimed          float64
 	cpRequested      float64
 	cpDone           float64
@@ -142,21 +134,36 @@ type Collector struct {
 
 	walSize          sql.Null[float64]
 	replicationSlots []replicationSlot
-	archPrev         *archiverStats
 	archStats        *archiverStats
 	archArchived     float64
 	archFailed       float64
 	wraparound       *wraparoundStats
 
-	scrapeErrors map[string]bool
+	scrapeErrors map[string]bool // error reason -> true
+}
+
+type Collector struct {
+	ctx           context.Context
+	ctxCancelFunc context.CancelFunc
+	wg            sync.WaitGroup
+
+	scrapeInterval time.Duration
+	collectTimeout time.Duration
+
+	db *sql.DB
+
+	// accessed only by the snapshot goroutine
+	cpPrev           *checkpointStats
+	archPrev         *archiverStats
+	prevSettingsText string
 
 	dbTracker        *databaseTracker
 	excludeDatabases map[string]bool
 	emitter          dbtracker.ChangeEmitter
 	targetAddr       string
-	prevSettingsText string
 
-	lock   sync.RWMutex
+	lock   sync.RWMutex // guards state
+	state  *pgState
 	logger logger.Logger
 }
 
@@ -166,8 +173,7 @@ func New(dsn string, scrapeInterval, collectTimeout time.Duration, logger logger
 		ctx:              ctx,
 		logger:           logger,
 		ctxCancelFunc:    cancelFunc,
-		done:             make(chan struct{}),
-		scrapeErrors:     map[string]bool{},
+		state:            &pgState{},
 		scrapeInterval:   scrapeInterval,
 		collectTimeout:   collectTimeout,
 		targetAddr:       targetAddr,
@@ -185,16 +191,21 @@ func New(dsn string, scrapeInterval, collectTimeout time.Duration, logger logger
 	c.db.SetMaxOpenConns(1)
 	trackSchema := c.emitter != nil
 	if trackSchema || trackSizes || trackBloat {
-		c.dbTracker = newDatabaseTracker(c.db, dsn, maxTablesPerDB, trackSchema, trackSizes, trackBloat, excludeDatabases, logger)
+		// the tracker runs concurrently with the snapshot: give it its own connection
+		// so that neither of them waits for the other one
+		c.db.SetMaxOpenConns(2)
+		c.dbTracker = newDatabaseTracker(c.db, dsn, maxTablesPerDB, trackSchema, trackSizes, trackBloat, excludeDatabases, snapshotTimeout(scrapeInterval), logger)
 	}
 	pingCtx, pingCancelFunc := context.WithTimeout(ctx, collectTimeout)
 	defer pingCancelFunc()
 	if err := c.db.PingContext(pingCtx); err != nil {
 		c.logger.Warning("probe failed:", err)
 	}
+	c.wg.Add(1)
 	go func() {
-		defer close(c.done)
+		defer c.wg.Done()
 		ticker := time.NewTicker(scrapeInterval)
+		defer ticker.Stop()
 		c.snapshot()
 		for {
 			select {
@@ -206,65 +217,87 @@ func New(dsn string, scrapeInterval, collectTimeout time.Duration, logger logger
 			}
 		}
 	}()
+	if c.dbTracker != nil {
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			// each database gets its own deadline inside collectSnapshot,
+			// so there is no overall deadline for a tracking run
+			c.dbTracker.Run(ctx, 0, c.emitter, c.targetAddr)
+		}()
+	}
 	return c, nil
 }
 
-func (c *Collector) snapshot() {
-	timeout := c.scrapeInterval - time.Second
+func snapshotTimeout(scrapeInterval time.Duration) time.Duration {
+	timeout := scrapeInterval - time.Second
 	if timeout <= 0 {
 		timeout = time.Second
 	}
+	return timeout
+}
 
-	ctx, cancelFunc := context.WithTimeout(c.ctx, timeout)
+func (c *Collector) getState() *pgState {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return c.state
+}
+
+func (c *Collector) addScrapeError(st *pgState, err error) {
+	c.logger.Warning(err)
+	st.scrapeErrors[errorReason(err)] = true
+}
+
+// snapshot queries the server without holding the lock: the new state is built from a
+// copy of the current one and published at the end, so a slow server never blocks Collect.
+func (c *Collector) snapshot() {
+	ctx, cancelFunc := context.WithTimeout(c.ctx, snapshotTimeout(c.scrapeInterval))
 	defer cancelFunc()
-	c.lock.Lock()
-	defer c.lock.Unlock()
 
-	c.scrapeErrors = map[string]bool{}
+	st := *c.getState() // shallow copy: fields are replaced, never mutated in place
+	st.scrapeErrors = map[string]bool{}
+	defer func() {
+		c.lock.Lock()
+		c.state = &st
+		c.lock.Unlock()
+	}()
 
-	c.origVersion = ""
+	st.origVersion = ""
 	var version semver.Version
 	var rawVersion string
 	err := c.db.QueryRowContext(ctx, `SELECT setting FROM pg_settings WHERE name='server_version'`).Scan(&rawVersion)
 	if err != nil {
-		c.logger.Warning(err)
-		c.scrapeErrors[err.Error()] = true
+		c.addScrapeError(&st, err)
 		return
 	}
-	c.origVersion, version, err = parsePgVersion(rawVersion)
+	st.origVersion, version, err = parsePgVersion(rawVersion)
 	if err != nil {
-		c.logger.Warning(err)
-		c.scrapeErrors[err.Error()] = true
+		c.addScrapeError(&st, err)
 		return
 	}
 
-	if c.settings, err = c.getSettings(ctx); err != nil {
-		c.scrapeErrors[err.Error()] = true
-		c.logger.Warning(err)
+	if st.settings, err = c.getSettings(ctx); err != nil {
+		c.addScrapeError(&st, err)
 	}
 
-	if c.replicationStatus, err = c.getReplicationStatus(ctx, version); err != nil {
-		c.scrapeErrors[err.Error()] = true
-		c.logger.Warning(err)
+	if st.replicationStatus, err = c.getReplicationStatus(ctx, version); err != nil {
+		c.addScrapeError(&st, err)
 	}
 
-	if err = c.getCheckpointStats(ctx, version); err != nil {
-		c.scrapeErrors[err.Error()] = true
-		c.logger.Warning(err)
+	if err = c.getCheckpointStats(ctx, version, &st); err != nil {
+		c.addScrapeError(&st, err)
 	}
 
-	if err = c.getWalStats(ctx, version); err != nil {
-		c.scrapeErrors[err.Error()] = true
-		c.logger.Warning(err)
+	if err = c.getWalStats(ctx, version, &st); err != nil {
+		c.addScrapeError(&st, err)
 	}
 
-	if err = c.getWraparoundStats(ctx, version); err != nil {
-		c.scrapeErrors[err.Error()] = true
-		c.logger.Warning(err)
+	if err = c.getWraparoundStats(ctx, version, &st); err != nil {
+		c.addScrapeError(&st, err)
 	}
 
 	querySizeLimit := 0
-	for _, s := range c.settings {
+	for _, s := range st.settings {
 		if s.Name == "track_activity_query_size" {
 			switch s.Unit {
 			case "B":
@@ -281,34 +314,29 @@ func (c *Collector) snapshot() {
 		querySizeLimit = hardQuerySizeLimit
 	}
 
-	c.ssPrev = c.ssCurr
-	c.saPrev = c.saCurr
+	st.ssPrev = st.ssCurr
+	st.saPrev = st.saCurr
 	prevStatements := map[statementId]ssRow{}
-	if c.ssPrev != nil {
-		prevStatements = c.ssPrev.rows
+	if st.ssPrev != nil {
+		prevStatements = st.ssPrev.rows
 	}
-	c.ssCurr, err = c.getStatStatements(ctx, version, querySizeLimit, prevStatements)
+	st.ssCurr, err = c.getStatStatements(ctx, version, querySizeLimit, prevStatements)
 	if err != nil {
-		c.logger.Warning(err)
-		c.scrapeErrors[err.Error()] = true
+		c.addScrapeError(&st, err)
 		return
 	}
-	c.saCurr, err = c.getPgStatActivity(ctx, version, querySizeLimit)
+	st.saCurr, err = c.getPgStatActivity(ctx, version, querySizeLimit)
 	if err != nil {
-		c.logger.Warning(err)
-		c.scrapeErrors[err.Error()] = true
+		c.addScrapeError(&st, err)
 		return
 	}
 
 	if c.emitter != nil {
-		c.trackSettingsChanges()
-	}
-	if c.dbTracker != nil {
-		c.dbTracker.Track(ctx, c.emitter, c.targetAddr)
+		c.trackSettingsChanges(st.settings)
 	}
 }
 
-func (c *Collector) summaries() (map[QueryKey]*QuerySummary, time.Duration) {
+func (c *pgState) summaries() (map[QueryKey]*QuerySummary, time.Duration) {
 	if c.saCurr == nil || c.saPrev == nil || c.ssCurr == nil || c.ssPrev == nil {
 		return nil, 0
 	}
@@ -350,7 +378,7 @@ func (c *Collector) summaries() (map[QueryKey]*QuerySummary, time.Duration) {
 	return res, c.ssCurr.ts.Sub(c.ssPrev.ts)
 }
 
-func (c *Collector) connectionMetrics(ch chan<- prometheus.Metric) {
+func (c *pgState) connectionMetrics(ch chan<- prometheus.Metric) {
 	if c.saCurr == nil {
 		return
 	}
@@ -407,8 +435,8 @@ func (c *Collector) connectionMetrics(ch chan<- prometheus.Metric) {
 	}
 }
 
-func (c *Collector) queryMetrics(ch chan<- prometheus.Metric) {
-	summaries, interval := c.summaries()
+func (c *Collector) queryMetrics(ch chan<- prometheus.Metric, st *pgState) {
+	summaries, interval := st.summaries()
 	if summaries == nil {
 		c.logger.Warning("no summaries")
 		return
@@ -440,17 +468,19 @@ func (c *Collector) tableSizeMetrics(ch chan<- prometheus.Metric) {
 		return
 	}
 	if c.dbTracker.trackSizes {
-		for dbName, snap := range c.dbTracker.DBSizes {
+		dbSizes, tableGrowth := c.dbTracker.Sizes()
+		for dbName, snap := range dbSizes {
 			ch <- gauge(dDbSize, snap.DatabaseSize, dbName)
 			for _, t := range snap.Tables {
 				ch <- gauge(dTableSize, t.Size, dbName, t.Schema, t.Table)
 			}
 		}
-		for _, g := range c.dbTracker.TableGrowth {
+		for _, g := range tableGrowth {
 			ch <- gauge(dTableSizeGrowth, g.Growth, g.DB, g.Schema, g.Table)
 		}
 	}
-	for dbName, b := range c.dbTracker.bloat {
+	bloat, tableStats, vacuumProgress := c.dbTracker.results()
+	for dbName, b := range bloat {
 		ch <- gauge(dDbTableBloat, b.TableTotal, dbName)
 		ch <- gauge(dDbIndexBloat, b.IndexTotal, dbName)
 		for _, t := range b.TopTables {
@@ -460,7 +490,7 @@ func (c *Collector) tableSizeMetrics(ch chan<- prometheus.Metric) {
 			ch <- gauge(dIndexBloat, ix.Bytes, dbName, ix.Schema, ix.Table, ix.Index)
 		}
 	}
-	for dbName, entries := range c.dbTracker.tableStats {
+	for dbName, entries := range tableStats {
 		for _, e := range entries {
 			ch <- gauge(dTableReltuples, e.Reltuples, dbName, e.Schema, e.Table)
 			if e.DeadBytes > 0 {
@@ -487,7 +517,7 @@ func (c *Collector) tableSizeMetrics(ch chan<- prometheus.Metric) {
 			}
 		}
 	}
-	for dbName, entries := range c.dbTracker.vacuumProgress {
+	for dbName, entries := range vacuumProgress {
 		for _, v := range entries {
 			ch <- gauge(dTableVacuumInProgress, 1, dbName, v.Schema, v.Table)
 			throttled := 0.0
@@ -501,7 +531,7 @@ func (c *Collector) tableSizeMetrics(ch chan<- prometheus.Metric) {
 
 func (c *Collector) Close() error {
 	c.ctxCancelFunc()
-	<-c.done
+	c.wg.Wait()
 	return c.db.Close()
 }
 
@@ -512,37 +542,36 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	if err := c.db.PingContext(ctx); err != nil {
 		c.logger.Warning("probe failed:", err)
 		ch <- gauge(dUp, 0)
-		ch <- gauge(dScrapeError, 1, err.Error(), "")
+		ch <- gauge(dScrapeError, 1, errorReason(err), "")
 		return
 	}
 	ch <- gauge(dUp, 1)
 	ch <- gauge(dProbe, time.Since(now).Seconds())
-	if c.origVersion != "" {
-		ch <- gauge(dInfo, 1, c.origVersion)
+
+	st := c.getState()
+	if st.origVersion != "" {
+		ch <- gauge(dInfo, 1, st.origVersion)
 	}
 
-	c.lock.RLock()
-	defer c.lock.RUnlock()
-
-	if len(c.scrapeErrors) > 0 {
-		for e := range c.scrapeErrors {
+	if len(st.scrapeErrors) > 0 {
+		for e := range st.scrapeErrors {
 			ch <- gauge(dScrapeError, 1, "", e)
 		}
 	} else {
 		ch <- gauge(dScrapeError, 0, "", "")
 	}
 
-	c.connectionMetrics(ch)
-	c.queryMetrics(ch)
+	st.connectionMetrics(ch)
+	c.queryMetrics(ch, st)
 	c.tableSizeMetrics(ch)
-	for _, s := range c.settings {
+	for _, s := range st.settings {
 		if s.IsMetric {
 			ch <- gauge(dSettings, s.Value, s.Name, s.Unit)
 		}
 	}
 
-	if c.replicationStatus != nil {
-		rs := c.replicationStatus
+	if st.replicationStatus != nil {
+		rs := st.replicationStatus
 		if rs.isInRecovery {
 			if rs.receiveLsn.Valid {
 				ch <- counter(dWalReceiveLsn, float64(rs.receiveLsn.Int64))
@@ -567,25 +596,25 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	ch <- counter(dCheckpointsScheduled, c.cpTimed, "timed")
-	ch <- counter(dCheckpointsScheduled, c.cpRequested, "requested")
-	ch <- counter(dCheckpoints, c.cpDone)
-	ch <- counter(dRestartpoints, c.cpRestartsDone)
-	ch <- counter(dBuffersWritten, c.cpBuffers, "checkpointer")
-	if c.cpWalBytes.Valid {
-		ch <- gauge(dWalSinceLastCheckpoint, c.cpWalBytes.V)
+	ch <- counter(dCheckpointsScheduled, st.cpTimed, "timed")
+	ch <- counter(dCheckpointsScheduled, st.cpRequested, "requested")
+	ch <- counter(dCheckpoints, st.cpDone)
+	ch <- counter(dRestartpoints, st.cpRestartsDone)
+	ch <- counter(dBuffersWritten, st.cpBuffers, "checkpointer")
+	if st.cpWalBytes.Valid {
+		ch <- gauge(dWalSinceLastCheckpoint, st.cpWalBytes.V)
 	}
-	if c.walSize.Valid {
-		ch <- gauge(dWalSize, c.walSize.V)
+	if st.walSize.Valid {
+		ch <- gauge(dWalSize, st.walSize.V)
 	}
-	for _, s := range c.replicationSlots {
+	for _, s := range st.replicationSlots {
 		if s.retained.Valid {
 			ch <- gauge(dReplicationSlotRetained, s.retained.V, s.name, strconv.FormatBool(s.active), s.walStatus)
 		}
 	}
-	ch <- counter(dWalArchivedSegments, c.archArchived)
-	ch <- counter(dWalArchiveFailures, c.archFailed)
-	if w := c.wraparound; w != nil {
+	ch <- counter(dWalArchivedSegments, st.archArchived)
+	ch <- counter(dWalArchiveFailures, st.archFailed)
+	if w := st.wraparound; w != nil {
 		for db, v := range w.xidAge {
 			ch <- gauge(dXidAge, v, db)
 		}
@@ -596,7 +625,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			ch <- gauge(dOldestXminAge, v, holder)
 		}
 	}
-	if a := c.archStats; a != nil {
+	if a := st.archStats; a != nil {
 		if a.lastArchived.Valid || a.lastFailed.Valid {
 			failing := a.lastFailed.Valid && (!a.lastArchived.Valid || a.lastFailed.V.After(a.lastArchived.V))
 			status := 1.0
@@ -606,8 +635,8 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			ch <- gauge(dWalArchivingStatus, status)
 		}
 	}
-	if !c.lastCheckpointAt.IsZero() {
-		ch <- gauge(dTimeSinceLastCheckpoint, time.Since(c.lastCheckpointAt).Seconds())
+	if !st.lastCheckpointAt.IsZero() {
+		ch <- gauge(dTimeSinceLastCheckpoint, time.Since(st.lastCheckpointAt).Seconds())
 	}
 }
 

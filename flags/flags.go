@@ -31,7 +31,7 @@ var (
 
 	CollectKubernetesEvents = kingpin.Flag("collect-kubernetes-events", "Collect and forward Kubernetes events").Envar("COLLECT_KUBERNETES_EVENTS").Default("true").Bool()
 
-	CollectAWSLogs       = kingpin.Flag("collect-aws-logs", "Collect and forward logs of RDS instances discovered through the AWS integration (Postgres)").Envar("COLLECT_AWS_LOGS").Default("true").Bool()
+	CollectAWSLogs       = kingpin.Flag("collect-aws-logs", "Collect and forward logs of RDS instances discovered through the AWS integration (PostgreSQL, MySQL, MariaDB)").Envar("COLLECT_AWS_LOGS").Default("true").Bool()
 	CollectGCPLogs       = kingpin.Flag("collect-gcp-logs", "Collect and forward logs of Cloud SQL instances discovered through the GCP integration").Envar("COLLECT_GCP_LOGS").Default("true").Bool()
 	CollectOCILogs       = kingpin.Flag("collect-oci-logs", "Collect and forward logs of the DB systems discovered through the OCI integration").Envar("COLLECT_OCI_LOGS").Default("true").Bool()
 	TrackDatabaseChanges = kingpin.Flag("track-database-changes", "Track schema and settings changes in databases").Envar("TRACK_DATABASE_CHANGES").Default("true").Bool()
@@ -40,6 +40,9 @@ var (
 	MaxTablesPerDatabase = kingpin.Flag("max-tables-per-database", "Skip databases with more tables than this limit").Envar("MAX_TABLES_PER_DATABASE").Default("1000").Int()
 	ConfigFile           = kingpin.Flag("config-file", "Path to a YAML file with static configuration (AWS, GCP and OCI integration settings and databases to monitor), merged with the configuration received from Coroot").Envar("CONFIG_FILE").String()
 	ExcludeDatabases     = kingpin.Flag("exclude-databases", "Databases to exclude from monitoring: no schema, size, connection or query statistics are collected for them").Envar("EXCLUDE_DATABASES").Default("rdsadmin", "cloudsqladmin", "mysql", "information_schema", "performance_schema", "sys", "mysql_innodb_cluster_metadata", "mysql_innodb_cluster_metadata_previous").Strings()
+
+	EnablePprof     = kingpin.Flag("enable-pprof", "Expose the Go profiling endpoints (/debug/pprof/) on the listen address").Envar("ENABLE_PPROF").Default("false").Bool()
+	ShutdownTimeout = kingpin.Flag("shutdown-timeout", "Maximum time to wait for a graceful shutdown (flushing metrics and logs) after SIGTERM/SIGINT").Envar("SHUTDOWN_TIMEOUT").Default("20s").Duration()
 )
 
 func init() {

@@ -4,11 +4,13 @@ import (
 	"context"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/coroot/coroot-cluster-agent/common"
 	"github.com/coroot/coroot-cluster-agent/obfuscate"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
 )
 
 const (
@@ -46,8 +48,8 @@ type CurrentOpStats struct {
 	FsyncLocked           bool
 }
 
-func (c *Collector) collectCurrentOp(ctx context.Context) error {
-	cursor, err := c.client.Database("admin").Aggregate(ctx, bson.A{
+func (c *Collector) collectCurrentOp(ctx context.Context, client *mongo.Client) (*CurrentOpStats, error) {
+	cursor, err := client.Database("admin").Aggregate(ctx, bson.A{
 		bson.D{{Key: "$currentOp", Value: bson.D{
 			{Key: "allUsers", Value: true},
 			{Key: "idleConnections", Value: true},
@@ -55,7 +57,7 @@ func (c *Collector) collectCurrentOp(ctx context.Context) error {
 		}}},
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer cursor.Close(ctx)
 
@@ -68,7 +70,7 @@ func (c *Collector) collectCurrentOp(ctx context.Context) error {
 	for cursor.Next(ctx) {
 		var op currentOpDoc
 		if err = cursor.Decode(&op); err != nil {
-			return err
+			return nil, err
 		}
 		stats.ConnectionsByApp[normalizeAppName(op.AppName)]++
 		if len(op.Transaction) > 0 {
@@ -93,9 +95,7 @@ func (c *Collector) collectCurrentOp(ctx context.Context) error {
 				coll = op.Ns[i+1:]
 			}
 			plan := op.PlanSummary
-			if len(plan) > 64 { // IXSCAN plans embed the index spec
-				plan = plan[:64]
-			}
+			plan = truncateUTF8(plan, 64) // IXSCAN plans embed the index spec
 			stats.LongRunning[longOpKey{
 				DB:         db,
 				Collection: coll,
@@ -105,15 +105,14 @@ func (c *Collector) collectCurrentOp(ctx context.Context) error {
 		}
 	}
 	if err = cursor.Err(); err != nil {
-		return err
+		return nil, err
 	}
 
 	stats.LongRunning = common.TopNMapByValue(stats.LongRunning, topLongRunningOpsN)
 	stats.ConnectionsByApp = common.TopNMapByValue(stats.ConnectionsByApp, topClientAppsN)
 	stats.OpenTransactionsByApp = common.TopNMapByValue(stats.OpenTransactionsByApp, topClientAppsN)
 
-	c.currentOp = stats
-	return nil
+	return stats, nil
 }
 
 var (
@@ -130,10 +129,7 @@ func normalizeAppName(app string) string {
 	if app == "" {
 		return "unknown"
 	}
-	if len(app) > 128 {
-		app = app[:128]
-	}
-	return app
+	return truncateUTF8(app, 128)
 }
 
 func opDatabase(ns string) string {
@@ -172,4 +168,17 @@ func (c *Collector) currentOpMetrics(ch chan<- prometheus.Metric) {
 		fsync = 1
 	}
 	ch <- common.Gauge(dFsyncLocked, fsync)
+}
+
+// truncateUTF8 cuts s to at most n bytes without splitting a multi-byte character
+// (an invalid UTF-8 label value makes the metric fail to be created).
+func truncateUTF8(s string, n int) string {
+	s = strings.ToValidUTF8(s, "?")
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }

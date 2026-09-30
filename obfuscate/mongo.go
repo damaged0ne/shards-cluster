@@ -2,8 +2,10 @@ package obfuscate
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -77,12 +79,22 @@ func MongoQueryShape(shape bson.D) string {
 		mongoWriteValue(&sb, e.Value, !mongoUnmaskedKeys[e.Key], 0)
 	}
 
-	res := sb.String()
-	if len(res) > mongoMaxLen {
-		res = res[:mongoMaxLen]
-	}
-	return res
+	return truncateUTF8(strings.ToValidUTF8(sb.String(), "?"), mongoMaxLen)
 }
+
+// truncateUTF8 cuts s to at most n bytes without splitting a multi-byte character.
+func truncateUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// reMongoFieldPath matches field paths ("$field.sub"), aggregation variables ("$$ROOT") and operators ("$gt").
+var reMongoFieldPath = regexp.MustCompile(`^\$\$?[A-Za-z_][\w.]*$`)
 
 func mongoPrimaryArg(command string) string {
 	switch command {
@@ -161,7 +173,7 @@ func mongoWriteValue(sb *strings.Builder, v any, mask bool, depth int) {
 		switch {
 		case strings.HasPrefix(val, "?"): // $queryStats placeholder like "?number"
 			sb.WriteByte('?')
-		case strings.HasPrefix(val, "$"): // field reference or operator
+		case reMongoFieldPath.MatchString(val): // field reference, variable or operator
 			sb.WriteString(val)
 		case !mask:
 			sb.WriteString(val)

@@ -2,6 +2,7 @@ package dbtracker
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/coroot/coroot-cluster-agent/common"
@@ -47,9 +48,13 @@ type Tracker struct {
 
 	prev           schema.Snapshot
 	lastTracked    time.Time
-	DBSizes        map[string]*DBSizeSnapshot
 	prevTableSizes map[schema.TableKey]float64
-	TableGrowth    []TableGrowthEntry
+
+	// DBSizes and TableGrowth are written by Track under mu. Callers that read them
+	// concurrently with Track must use Sizes().
+	mu          sync.RWMutex
+	DBSizes     map[string]*DBSizeSnapshot
+	TableGrowth []TableGrowthEntry
 }
 
 func NewTracker(dbSystem string, trackSchema, trackSizes bool, collect CollectFunc, logger logger.Logger) *Tracker {
@@ -74,12 +79,16 @@ func (t *Tracker) Track(ctx context.Context, emitter ChangeEmitter, targetAddr s
 		t.logger.Warning("database tracking:", err)
 		return
 	}
-	t.DBSizes = dbSizes
 
+	growth := t.TableGrowth
 	if t.trackSizes {
-		t.computeTableGrowth(dbSizes, t.lastTracked.Sub(prevTracked))
+		growth = t.computeTableGrowth(dbSizes, t.lastTracked.Sub(prevTracked))
 		trimTopTables(dbSizes, TopTablesN)
 	}
+	t.mu.Lock()
+	t.DBSizes = dbSizes
+	t.TableGrowth = growth
+	t.mu.Unlock()
 
 	if t.trackSchema {
 		for _, c := range schema.Diff(t.prev, curr) {
@@ -89,7 +98,40 @@ func (t *Tracker) Track(ctx context.Context, emitter ChangeEmitter, targetAddr s
 	}
 }
 
-func (t *Tracker) computeTableGrowth(dbSizes map[string]*DBSizeSnapshot, elapsed time.Duration) {
+// Sizes returns the latest published database sizes and table growth rates.
+// The returned values must not be modified.
+func (t *Tracker) Sizes() (map[string]*DBSizeSnapshot, []TableGrowthEntry) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.DBSizes, t.TableGrowth
+}
+
+// Run calls Track immediately and then every TrackMinInterval until ctx is canceled.
+// Each Track call gets its own deadline of timeout (no deadline if timeout <= 0),
+// so a slow tracking run never shares a deadline with the collector's main snapshot.
+func (t *Tracker) Run(ctx context.Context, timeout time.Duration, emitter ChangeEmitter, targetAddr string) {
+	track := func() {
+		tctx, cancel := ctx, context.CancelFunc(func() {})
+		if timeout > 0 {
+			tctx, cancel = context.WithTimeout(ctx, timeout)
+		}
+		defer cancel()
+		t.Track(tctx, emitter, targetAddr)
+	}
+	ticker := time.NewTicker(TrackMinInterval)
+	defer ticker.Stop()
+	track()
+	for {
+		select {
+		case <-ticker.C:
+			track()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (t *Tracker) computeTableGrowth(dbSizes map[string]*DBSizeSnapshot, elapsed time.Duration) []TableGrowthEntry {
 	currSizes := map[schema.TableKey]float64{}
 	for _, snap := range dbSizes {
 		for _, te := range snap.Tables {
@@ -97,7 +139,7 @@ func (t *Tracker) computeTableGrowth(dbSizes map[string]*DBSizeSnapshot, elapsed
 		}
 	}
 
-	t.TableGrowth = nil
+	var res []TableGrowthEntry
 	if t.prevTableSizes != nil && elapsed > 0 {
 		var all []TableGrowthEntry
 		for key, currSize := range currSizes {
@@ -108,9 +150,10 @@ func (t *Tracker) computeTableGrowth(dbSizes map[string]*DBSizeSnapshot, elapsed
 				}
 			}
 		}
-		t.TableGrowth = common.TopN(all, TopTablesN, func(a, b TableGrowthEntry) bool { return a.Growth > b.Growth })
+		res = common.TopN(all, TopTablesN, func(a, b TableGrowthEntry) bool { return a.Growth > b.Growth })
 	}
 	t.prevTableSizes = currSizes
+	return res
 }
 
 func trimTopTables(dbSizes map[string]*DBSizeSnapshot, n int) {

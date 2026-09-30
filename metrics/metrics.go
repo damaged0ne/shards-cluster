@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"slices"
 	"sort"
 
 	"net/http"
@@ -57,6 +58,13 @@ type Metrics struct {
 	ksm          *ksm.KSM
 
 	changeEmitter *emitter.ChangeEmitter
+
+	// startTarget starts the exporter of a target; replaced in tests
+	startTarget func(t *Target, credentials Credentials, tlsCreds common.TLSCredentials) error
+
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	scraper  *scraperState
 }
 
 func NewMetrics(k8s *k8s.K8S, static *config.Static) (*Metrics, error) {
@@ -76,7 +84,9 @@ func NewMetrics(k8s *k8s.K8S, static *config.Static) (*Metrics, error) {
 		targets:        map[string]*Target{},
 		k8s:            k8s,
 		static:         static,
+		stopCh:         make(chan struct{}),
 	}
+	ms.startTarget = ms.startTargetExporter
 
 	var err error
 	ksmAddr := *flags.KubeStateMetricsListenAddress
@@ -109,14 +119,41 @@ func (ms *Metrics) Start() error {
 	return ms.runScraper()
 }
 
-func (ms *Metrics) Stop() {
-	if ms.ksm != nil {
-		ms.ksm.Stop()
-	}
+// Stop stops discovery and scraping, closes the exporters of all targets and flushes the remote-write queue.
+// It returns early if ctx is done before everything has been stopped.
+func (ms *Metrics) Stop(ctx context.Context) {
+	ms.stopOnce.Do(func() {
+		close(ms.stopCh)
+		if ms.ksm != nil {
+			ms.ksm.Stop()
+		}
+		ms.stopScraper(ctx)
+		ms.targetsLock.Lock()
+		targets := maps.Values(ms.targets)
+		ms.targets = map[string]*Target{}
+		ms.targetsLock.Unlock()
+		common.RunWithContext(ctx, "stopping exporters", func() {
+			var wg sync.WaitGroup
+			for _, t := range targets {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					t.StopExporter(ms.reg)
+				}()
+			}
+			wg.Wait()
+		})
+		ms.closeStorage(ctx)
+	})
 }
 
 func (ms *Metrics) ListenConfigUpdates(updates <-chan config.Config) {
 	go func() {
+		defer func() { // the updater has been stopped
+			ms.updateAWS(nil)
+			ms.updateGCP(nil)
+			ms.updateOCI(nil)
+		}()
 		for cfg := range updates {
 			var targets []*Target
 			for _, i := range cfg.ApplicationInstrumentation {
@@ -140,8 +177,23 @@ func (ms *Metrics) ListenPodEvents(events <-chan k8s.PodEvent) {
 	ms.k8sPodEvents = events
 }
 
+// HttpHandler serves the metrics of the targets along with the agent's own metrics
+// (Go runtime, process, and the scrape manager/remote-write/WAL metrics registered on the default registerer).
 func (ms *Metrics) HttpHandler() http.Handler {
-	return promhttp.HandlerFor(ms.reg, promhttp.HandlerOpts{})
+	return promhttp.HandlerFor(
+		prometheus.Gatherers{ms.reg, prometheus.DefaultGatherer},
+		promhttp.HandlerOpts{
+			// a single target returning an invalid or inconsistent metric must not fail the whole response
+			ErrorHandling: promhttp.ContinueOnError,
+			ErrorLog:      promErrorLog{},
+		},
+	)
+}
+
+type promErrorLog struct{}
+
+func (promErrorLog) Println(v ...interface{}) {
+	klog.Errorln(v...)
 }
 
 func (ms *Metrics) addTarget(target *Target) {
@@ -151,137 +203,183 @@ func (ms *Metrics) addTarget(target *Target) {
 	ms.targets[target.Addr] = target
 }
 
+// delTarget removes the target (if it's still the one stored for its address) and stops its exporter.
 func (ms *Metrics) delTarget(target *Target) {
 	klog.Infof("removing target: %s", target)
 	ms.targetsLock.Lock()
-	t := ms.targets[target.Addr]
-	delete(ms.targets, target.Addr)
+	if ms.targets[target.Addr] == target {
+		delete(ms.targets, target.Addr)
+	}
 	ms.targetsLock.Unlock()
-	if t != nil {
+	target.StopExporter(ms.reg)
+}
+
+func (ms *Metrics) startExporters() {
+	ticker := time.NewTicker(ExportersRecheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ms.stopCh:
+			return
+		case <-ticker.C:
+			ms.startPendingExporters()
+		}
+	}
+}
+
+// isCurrent reports whether t is still the active target for its address,
+// i.e. it hasn't been removed or replaced by discovery.
+func (ms *Metrics) isCurrent(t *Target) bool {
+	ms.targetsLock.Lock()
+	defer ms.targetsLock.Unlock()
+	return ms.targets[t.Addr] == t
+}
+
+func (ms *Metrics) startTargetExporter(t *Target, credentials Credentials, tlsCreds common.TLSCredentials) error {
+	return t.StartExporter(ms.reg, credentials, tlsCreds, ms.scrapeInterval, ms.scrapeTimeout, ms.changeEmitter, *flags.MaxTablesPerDatabase, *flags.TrackDatabaseSizes, *flags.TrackDatabaseBloat, *flags.ExcludeDatabases)
+}
+
+// startTarget starts the exporter of t unless t has been removed or replaced in the meantime.
+// Starting can take a while (connecting to the database), so the target is re-checked afterward:
+// if discovery removed or replaced it during the start, delTarget couldn't stop it (no exporter yet),
+// so it's stopped here instead of being left running as an orphan.
+func (ms *Metrics) startTargetIfCurrent(t *Target, credentials Credentials, tlsCreds common.TLSCredentials) {
+	if !ms.isCurrent(t) {
+		return
+	}
+	if err := ms.startTarget(t, credentials, tlsCreds); err != nil {
+		t.logger.Errorf("failed to start exporter: %s", err)
+		return
+	}
+	if !ms.isCurrent(t) {
+		t.logger.Infof("the target has been removed or replaced while its exporter was starting, stopping it")
 		t.StopExporter(ms.reg)
 	}
 }
 
-func (ms *Metrics) startExporters() {
-	for range time.Tick(ExportersRecheckInterval) {
-		ms.targetsLock.Lock()
-		var targets []*Target
-		for _, t := range ms.targets {
-			if !t.IsExporterStarted() {
-				targets = append(targets, t)
+type secretId struct {
+	namespace, name string
+}
+
+// secretKeys returns the keys to read from each secret referenced by the targets
+// (a secret can be shared by several targets and hold both the credentials and the TLS material).
+func secretKeys(targets []*Target) map[secretId][]string {
+	id2Keys := map[secretId][]string{}
+	for _, t := range targets {
+		if s := t.CredentialsSecret; s.Name != "" {
+			id := secretId{namespace: s.Namespace, name: s.Name}
+			for _, key := range []string{s.UsernameKey, s.PasswordKey} {
+				if key != "" {
+					id2Keys[id] = append(id2Keys[id], key)
+				}
 			}
 		}
-		ms.targetsLock.Unlock()
+		if s := t.TLSSecret; s.Name != "" {
+			id := secretId{namespace: s.Namespace, name: s.Name}
+			for _, key := range []string{s.CAKey, s.CertKey, s.KeyKey} {
+				if key != "" {
+					id2Keys[id] = append(id2Keys[id], key)
+				}
+			}
+		}
+	}
+	for id, keys := range id2Keys {
+		slices.Sort(keys)
+		id2Keys[id] = slices.Compact(keys)
+	}
+	return id2Keys
+}
 
-		if len(targets) == 0 {
+func (ms *Metrics) startPendingExporters() {
+	ms.targetsLock.Lock()
+	var targets []*Target
+	for _, t := range ms.targets {
+		if !t.IsExporterStarted() {
+			targets = append(targets, t)
+		}
+	}
+	ms.targetsLock.Unlock()
+
+	if len(targets) == 0 {
+		return
+	}
+
+	id2Keys := secretKeys(targets)
+	var err error
+	secrets := map[secretId]map[string]string{}
+	var isSecretsForbidden bool
+	for id, keys := range id2Keys {
+		secrets[id], err = ms.k8s.GetSecret(id.namespace, id.name, keys...)
+		if err != nil {
+			if errors.Is(err, k8s.ErrForbidden) {
+				isSecretsForbidden = true
+				break
+			}
+			if errors.Is(err, k8s.ErrNotFound) {
+				continue
+			}
+			klog.Errorf("failed to get secret '%s': %s", id.name, err)
 			continue
 		}
+	}
 
-		type secretId struct {
-			namespace, name string
-		}
-		id2Keys := map[secretId][]string{}
-		for _, t := range targets {
-			if s := t.CredentialsSecret; s.Name != "" {
-				var keys []string
-				if s.UsernameKey != "" {
-					keys = append(keys, s.UsernameKey)
-				}
-				if s.PasswordKey != "" {
-					keys = append(keys, s.PasswordKey)
-				}
-				if len(keys) > 0 {
-					id2Keys[secretId{namespace: s.Namespace, name: s.Name}] = keys
-				}
-			}
-			if s := t.TLSSecret; s.Name != "" {
-				id := secretId{namespace: s.Namespace, name: s.Name}
-				for _, key := range []string{s.CAKey, s.CertKey, s.KeyKey} {
-					if key != "" {
-						id2Keys[id] = append(id2Keys[id], key)
-					}
-				}
-			}
-		}
-		var err error
-		secrets := map[secretId]map[string]string{}
-		var isSecretsForbidden bool
-		for id, keys := range id2Keys {
-			secrets[id], err = ms.k8s.GetSecret(id.namespace, id.name, keys...)
-			if err != nil {
-				if errors.Is(err, k8s.ErrForbidden) {
-					isSecretsForbidden = true
-					break
-				}
-				if errors.Is(err, k8s.ErrNotFound) {
-					continue
-				}
-				klog.Errorf("failed to get secret '%s': %s", id.name, err)
+	if isSecretsForbidden {
+		klog.Errorln("Cannot retrieve secrets: access forbidden. Update Coroot Operator to proceed.")
+	}
+
+	for _, t := range targets {
+		credentials := t.Credentials
+		if s := t.CredentialsSecret; s.Name != "" {
+			kv := secrets[secretId{namespace: s.Namespace, name: s.Name}]
+			switch {
+			case isSecretsForbidden:
+				t.logger.Errorf("failed to start exporter: secret '%s' forbidden", s.Name)
 				continue
-			}
-		}
-
-		if isSecretsForbidden {
-			klog.Errorln("Cannot retrieve secrets: access forbidden. Update Coroot Operator to proceed.")
-		}
-
-		for _, t := range targets {
-			credentials := t.Credentials
-			if s := t.CredentialsSecret; s.Name != "" {
-				kv := secrets[secretId{namespace: s.Namespace, name: s.Name}]
-				switch {
-				case isSecretsForbidden:
-					t.logger.Errorf("failed to start exporter: secret '%s' forbidden", s.Name)
-					continue
-				case kv == nil:
-					t.logger.Errorf("failed to start exporter: secret '%s' not found", s.Name)
-					continue
-				default:
-					if username := kv[s.UsernameKey]; username != "" {
-						credentials.Username = username
-					}
-					if password := kv[s.PasswordKey]; password != "" {
-						credentials.Password = password
-					}
-				}
-			}
-			var tlsCreds common.TLSCredentials
-			if s := t.TLSSecret; s.Name != "" {
-				kv := secrets[secretId{namespace: s.Namespace, name: s.Name}]
-				switch {
-				case isSecretsForbidden:
-					t.logger.Errorf("failed to start exporter: secret '%s' forbidden", s.Name)
-					continue
-				case kv == nil:
-					t.logger.Errorf("failed to start exporter: TLS secret '%s' not found", s.Name)
-					continue
-				default:
-					if (s.CertKey != "") != (s.KeyKey != "") {
-						t.logger.Errorf("failed to start exporter: TLS secret '%s': the cert and key keys must be set together", s.Name)
-						continue
-					}
-					if s.CAKey == "" && s.CertKey == "" {
-						t.logger.Errorf("failed to start exporter: TLS secret '%s': no keys specified (set the ca-key and/or cert-key/key-key annotations)", s.Name)
-						continue
-					}
-					if s.CAKey != "" {
-						tlsCreds.CA = kv[s.CAKey]
-					}
-					if s.CertKey != "" {
-						tlsCreds.Cert = kv[s.CertKey]
-						tlsCreds.Key = kv[s.KeyKey]
-					}
-					if tlsCreds.CA == "" && (tlsCreds.Cert == "" || tlsCreds.Key == "") {
-						t.logger.Errorf("failed to start exporter: TLS secret '%s' does not contain the specified keys", s.Name)
-						continue
-					}
-				}
-			}
-			if err := t.StartExporter(ms.reg, credentials, tlsCreds, ms.scrapeInterval, ms.scrapeTimeout, ms.changeEmitter, *flags.MaxTablesPerDatabase, *flags.TrackDatabaseSizes, *flags.TrackDatabaseBloat, *flags.ExcludeDatabases); err != nil {
-				t.logger.Errorf("failed to start exporter: %s", err)
+			case kv == nil:
+				t.logger.Errorf("failed to start exporter: secret '%s' not found", s.Name)
 				continue
+			default:
+				if username := kv[s.UsernameKey]; username != "" {
+					credentials.Username = username
+				}
+				if password := kv[s.PasswordKey]; password != "" {
+					credentials.Password = password
+				}
 			}
 		}
+		var tlsCreds common.TLSCredentials
+		if s := t.TLSSecret; s.Name != "" {
+			kv := secrets[secretId{namespace: s.Namespace, name: s.Name}]
+			switch {
+			case isSecretsForbidden:
+				t.logger.Errorf("failed to start exporter: secret '%s' forbidden", s.Name)
+				continue
+			case kv == nil:
+				t.logger.Errorf("failed to start exporter: TLS secret '%s' not found", s.Name)
+				continue
+			default:
+				if (s.CertKey != "") != (s.KeyKey != "") {
+					t.logger.Errorf("failed to start exporter: TLS secret '%s': the cert and key keys must be set together", s.Name)
+					continue
+				}
+				if s.CAKey == "" && s.CertKey == "" {
+					t.logger.Errorf("failed to start exporter: TLS secret '%s': no keys specified (set the ca-key and/or cert-key/key-key annotations)", s.Name)
+					continue
+				}
+				if s.CAKey != "" {
+					tlsCreds.CA = kv[s.CAKey]
+				}
+				if s.CertKey != "" {
+					tlsCreds.Cert = kv[s.CertKey]
+					tlsCreds.Key = kv[s.KeyKey]
+				}
+				if tlsCreds.CA == "" && (tlsCreds.Cert == "" || tlsCreds.Key == "") {
+					t.logger.Errorf("failed to start exporter: TLS secret '%s' does not contain the specified keys", s.Name)
+					continue
+				}
+			}
+		}
+		ms.startTargetIfCurrent(t, credentials, tlsCreds)
 	}
 }
 
@@ -347,39 +445,58 @@ func (ms *Metrics) logCloudError(cloud string, err error) bool {
 
 func (ms *Metrics) discoverFromPods() {
 	for e := range ms.k8sPodEvents {
-		switch e.Type {
-		case k8s.PodEventTypeAdd, k8s.PodEventTypeChange:
-			target := TargetFromPod(e.Pod)
-			old := TargetFromPod(e.Old)
-			if target == nil {
-				if old != nil {
-					ms.delTarget(old)
-				}
-				continue
-			}
-			if old != nil && old.Addr != target.Addr { // e.g. the pod IP has changed
-				ms.delTarget(old)
-			}
-			ms.targetsLock.Lock()
-			t := ms.targets[target.Addr]
-			ms.targetsLock.Unlock()
-			switch {
-			case t == nil:
-				ms.addTarget(target)
-			case t.Equal(target):
-				continue
-			default:
-				ms.delTarget(t)
-				ms.addTarget(target)
-			}
-		case k8s.PodEventTypeDelete:
-			target := TargetFromPod(e.Pod)
-			if target == nil {
-				continue
-			}
-			ms.delTarget(target)
-		}
+		ms.handlePodEvent(e)
 	}
+}
+
+func (ms *Metrics) handlePodEvent(e k8s.PodEvent) {
+	switch e.Type {
+	case k8s.PodEventTypeAdd, k8s.PodEventTypeChange:
+		target := TargetFromPod(e.Pod)
+		old := TargetFromPod(e.Old)
+		if target == nil {
+			if old != nil {
+				ms.delPodTarget(old)
+			}
+			return
+		}
+		if old != nil && old.Addr != target.Addr { // e.g. the pod IP has changed
+			ms.delPodTarget(old)
+		}
+		ms.targetsLock.Lock()
+		t := ms.targets[target.Addr]
+		ms.targetsLock.Unlock()
+		switch {
+		case t == nil:
+			ms.addTarget(target)
+		case t.Equal(target) && t.podKey == target.podKey:
+			return
+		default: // a changed target, or another pod (or a configured target) that had the same address
+			ms.delTarget(t)
+			ms.addTarget(target)
+		}
+	case k8s.PodEventTypeDelete:
+		target := TargetFromPod(e.Pod)
+		if target == nil {
+			return
+		}
+		ms.delPodTarget(target)
+	}
+}
+
+// delPodTarget removes the target stored for target.Addr only if it was discovered from the same pod,
+// so that the removal of a pod doesn't remove the target of another pod that has reused its IP address.
+func (ms *Metrics) delPodTarget(target *Target) {
+	ms.targetsLock.Lock()
+	t := ms.targets[target.Addr]
+	if t == nil || !t.DiscoveredFromPodAnnotations || t.podKey != target.podKey {
+		ms.targetsLock.Unlock()
+		return
+	}
+	delete(ms.targets, target.Addr)
+	ms.targetsLock.Unlock()
+	klog.Infof("removing target: %s", t)
+	t.StopExporter(ms.reg)
 }
 
 func (ms *Metrics) resolveDatabases(databases []config.Database) []*Target {

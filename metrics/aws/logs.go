@@ -2,8 +2,10 @@ package aws
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -18,23 +20,28 @@ const (
 
 type LogReader struct {
 	discoverer *Discoverer
+	ctx        context.Context
 	instanceId *string
 	logs       map[string]*logFileMeta
 	ch         chan<- logparser.LogEntry
-	stop       chan bool
+	stop       chan struct{}
+	stopOnce   sync.Once
 }
 
-func NewLogReader(discoverer *Discoverer, instanceId *string, ch chan<- logparser.LogEntry) *LogReader {
+// NewLogReader starts reading the logs of the instance in the background until Stop is called or ctx is cancelled.
+func NewLogReader(ctx context.Context, discoverer *Discoverer, instanceId *string, ch chan<- logparser.LogEntry) *LogReader {
 	r := &LogReader{
 		discoverer: discoverer,
+		ctx:        ctx,
 		instanceId: instanceId,
 		logs:       map[string]*logFileMeta{},
 		ch:         ch,
-		stop:       make(chan bool),
+		stop:       make(chan struct{}),
 	}
-	initialized := r.refresh(true)
 	go func() {
+		initialized := r.refresh(true)
 		t := time.NewTicker(logsRefreshInterval)
+		defer t.Stop()
 		for {
 			select {
 			case <-r.stop:
@@ -49,23 +56,46 @@ func NewLogReader(discoverer *Discoverer, instanceId *string, ch chan<- logparse
 	return r
 }
 
+// Stop is idempotent and doesn't wait for an in-flight refresh.
 func (r *LogReader) Stop() {
-	r.stop <- true
+	r.stopOnce.Do(func() {
+		close(r.stop)
+	})
+}
+
+func (r *LogReader) stopped() bool {
+	select {
+	case <-r.stop:
+		return true
+	default:
+		return r.ctx.Err() != nil
+	}
 }
 
 func (r *LogReader) refresh(init bool) bool {
+	if r.stopped() {
+		return false
+	}
 	t := time.Now()
 	defer func() {
-		klog.Infoln("refreshed in", time.Since(t).Truncate(time.Millisecond))
+		klog.V(2).Infoln(aws.ToString(r.instanceId), "logs refreshed in", time.Since(t).Truncate(time.Millisecond))
 	}()
-	res, err := r.discoverer.RDSClient().DescribeDBLogFiles(r.discoverer.ctx, &rds.DescribeDBLogFilesInput{DBInstanceIdentifier: r.instanceId})
+	ctx, cancel := context.WithTimeout(r.ctx, apiTimeout)
+	res, err := r.discoverer.RDSClient().DescribeDBLogFiles(ctx, &rds.DescribeDBLogFilesInput{DBInstanceIdentifier: r.instanceId})
+	cancel()
 	if err != nil {
+		if r.stopped() {
+			return false
+		}
 		klog.Warning("failed to describe log files:", err)
 		r.discoverer.registerError(err)
 		return false
 	}
 	seenLogs := map[string]bool{}
 	for _, f := range res.DescribeDBLogFiles {
+		if r.stopped() {
+			return false
+		}
 		fileName := aws.ToString(f.LogFileName)
 		seenLogs[fileName] = true
 		meta := r.logs[fileName]
@@ -115,7 +145,9 @@ func (r *LogReader) download(logFileName string, marker *string, numberOfLines *
 		Marker:               marker,
 		NumberOfLines:        numberOfLines,
 	}
-	response, err := r.discoverer.RDSClient().DownloadDBLogFilePortion(r.discoverer.ctx, &request)
+	ctx, cancel := context.WithTimeout(r.ctx, apiTimeout)
+	defer cancel()
+	response, err := r.discoverer.RDSClient().DownloadDBLogFilePortion(ctx, &request)
 	if err != nil {
 		return nil, fmt.Errorf(`failed to download file %s: %s`, logFileName, err)
 	}
@@ -129,7 +161,11 @@ func (r *LogReader) write(data *string) {
 		if err != nil {
 			break
 		}
-		r.ch <- logparser.LogEntry{Content: strings.TrimSuffix(line, "\n"), Level: logparser.LevelUnknown}
+		select {
+		case r.ch <- logparser.LogEntry{Content: strings.TrimSuffix(line, "\n"), Level: logparser.LevelUnknown}:
+		case <-r.stop: // the parser may be stopped already
+			return
+		}
 	}
 }
 

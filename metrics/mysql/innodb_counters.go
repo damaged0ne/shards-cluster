@@ -10,20 +10,19 @@ type innodbCounters struct {
 	values map[string]float64
 }
 
-func (c *Collector) innodbCountersSnapshot(ctx context.Context) {
-	counters, err := c.queryInnodbCounters(ctx)
+func (c *Collector) innodbCountersSnapshot(ctx context.Context, st *state) {
+	counters, err := c.queryInnodbCounters(ctx, st.isMariaDB)
 	if err != nil {
-		c.logger.Warning(err)
-		c.scrapeErrors[err.Error()] = true
+		c.addScrapeError(st, err)
 		return
 	}
-	c.innodbCounters = counters
+	st.innodbCounters = counters
 }
 
-func (c *Collector) queryInnodbCounters(ctx context.Context) (*innodbCounters, error) {
+func (c *Collector) queryInnodbCounters(ctx context.Context, isMariaDB bool) (*innodbCounters, error) {
 	res := &innodbCounters{values: map[string]float64{}}
 	enabled := "STATUS = 'enabled'"
-	if c.isMariaDB {
+	if isMariaDB {
 		enabled = "ENABLED = 1"
 	}
 	rows, err := c.db.QueryContext(ctx, `
@@ -50,12 +49,12 @@ func (c *Collector) queryInnodbCounters(ctx context.Context) (*innodbCounters, e
 	return res, nil
 }
 
-func (c *Collector) innodbCountersMetrics(ch chan<- prometheus.Metric) {
-	if c.innodbCounters == nil {
+func (st *state) innodbCountersMetrics(ch chan<- prometheus.Metric) {
+	if st.innodbCounters == nil {
 		return
 	}
 	emit := func(desc *prometheus.Desc, name string, typ prometheus.ValueType) {
-		v, ok := c.innodbCounters.values[name]
+		v, ok := st.innodbCounters.values[name]
 		if !ok {
 			return
 		}

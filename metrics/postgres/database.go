@@ -26,10 +26,18 @@ type databaseTracker struct {
 	perDBTimeout     time.Duration
 	logger           logger.Logger
 
-	mu             sync.RWMutex // guards bloat, tableStats and vacuumProgress
+	mu             sync.RWMutex // guards bloat, tableStats, vacuumProgress, indexStats and errReasons
 	bloat          map[string]*dbBloat
 	tableStats     map[string][]tableStatEntry
 	vacuumProgress map[string][]vacuumProgressEntry
+	indexStats     map[string]*dbIndexStats
+	errReasons     map[string]bool // bounded error reasons of the optional per-database queries
+}
+
+// trackerRun accumulates the results of optional per-database queries during a tracking run.
+type trackerRun struct {
+	indexStats map[string]*dbIndexStats
+	errReasons map[string]bool
 }
 
 func newDatabaseTracker(db *sql.DB, baseDSN string, maxTablesPerDB int, trackSchema, trackSizes, trackBloat bool, excludeDatabases []string, perDBTimeout time.Duration, logger logger.Logger) *databaseTracker {
@@ -66,6 +74,20 @@ func (dt *databaseTracker) results() (map[string]*dbBloat, map[string][]tableSta
 	return dt.bloat, dt.tableStats, dt.vacuumProgress
 }
 
+// indexResults returns the latest unused/duplicate index stats by database. Must not be modified.
+func (dt *databaseTracker) indexResults() map[string]*dbIndexStats {
+	dt.mu.RLock()
+	defer dt.mu.RUnlock()
+	return dt.indexStats
+}
+
+// errorReasons returns the error reasons of the last tracking run. Must not be modified.
+func (dt *databaseTracker) errorReasons() map[string]bool {
+	dt.mu.RLock()
+	defer dt.mu.RUnlock()
+	return dt.errReasons
+}
+
 func (dt *databaseTracker) collectSnapshot(ctx context.Context) (schema.Snapshot, map[string]*dbtracker.DBSizeSnapshot, error) {
 	listCtx, listCancel := dt.withTimeout(ctx)
 	databases, dbSizes, err := listDatabasesWithSizes(listCtx, dt.db, dt.excludeDatabases)
@@ -78,6 +100,7 @@ func (dt *databaseTracker) collectSnapshot(ctx context.Context) (schema.Snapshot
 	bloat := map[string]*dbBloat{}
 	tableStats := map[string][]tableStatEntry{}
 	vacuumProgress := map[string][]vacuumProgressEntry{}
+	run := &trackerRun{indexStats: map[string]*dbIndexStats{}, errReasons: map[string]bool{}}
 	for _, dbName := range databases {
 		if ctx.Err() != nil {
 			break
@@ -85,7 +108,7 @@ func (dt *databaseTracker) collectSnapshot(ctx context.Context) (schema.Snapshot
 		dsn := replaceDatabaseInDSN(dt.baseDSN, dbName)
 		// each database gets its own deadline, so a slow database doesn't starve the next ones
 		dbCtx, dbCancel := dt.withTimeout(ctx)
-		tables, b, stats, vac, err := dt.collectDatabase(dbCtx, dsn, dbName, snapshot)
+		tables, b, stats, vac, err := dt.collectDatabase(dbCtx, dsn, dbName, snapshot, run)
 		dbCancel()
 		if err != nil {
 			dt.logger.Warning("database tracking for", dbName+":", err)
@@ -108,15 +131,18 @@ func (dt *databaseTracker) collectSnapshot(ctx context.Context) (schema.Snapshot
 			}
 		}
 	}
+	trimUnusedIndexes(run.indexStats, unusedIndexesTopN)
 	dt.mu.Lock()
 	dt.bloat = bloat
 	dt.tableStats = tableStats
 	dt.vacuumProgress = vacuumProgress
+	dt.indexStats = run.indexStats
+	dt.errReasons = run.errReasons
 	dt.mu.Unlock()
 	return snapshot, dbSizes, nil
 }
 
-func (dt *databaseTracker) collectDatabase(ctx context.Context, dsn, dbName string, snapshot schema.Snapshot) ([]dbtracker.TableSizeEntry, *dbBloat, []tableStatEntry, []vacuumProgressEntry, error) {
+func (dt *databaseTracker) collectDatabase(ctx context.Context, dsn, dbName string, snapshot schema.Snapshot, run *trackerRun) ([]dbtracker.TableSizeEntry, *dbBloat, []tableStatEntry, []vacuumProgressEntry, error) {
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -179,6 +205,13 @@ WHERE c.relkind = 'r'
 	}
 
 	tableStats := collectTableStats(ctx, db, dt.logger)
+
+	idx, errs := collectIndexStats(ctx, db)
+	for _, err := range errs {
+		dt.logger.Warning("index stats for", dbName+":", err)
+		run.errReasons[errorReason(err)] = true
+	}
+	run.indexStats[dbName] = idx
 
 	tableSizes, err := queryTableSizes(ctx, db, dbName)
 	if err != nil {

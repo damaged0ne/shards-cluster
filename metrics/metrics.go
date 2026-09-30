@@ -17,6 +17,7 @@ import (
 	"github.com/coroot/coroot-cluster-agent/flags"
 	"github.com/coroot/coroot-cluster-agent/k8s"
 	"github.com/coroot/coroot-cluster-agent/metrics/aws"
+	"github.com/coroot/coroot-cluster-agent/metrics/azure"
 	"github.com/coroot/coroot-cluster-agent/metrics/gcp"
 	"github.com/coroot/coroot-cluster-agent/metrics/ksm"
 	"github.com/coroot/coroot-cluster-agent/metrics/mysql"
@@ -51,6 +52,7 @@ type Metrics struct {
 	aws          *aws.Discoverer
 	gcp          *gcp.Discoverer
 	oci          *oci.Discoverer
+	azure        *azure.Discoverer
 	cloudErrors  map[string]string
 	k8s          *k8s.K8S
 	static       *config.Static
@@ -153,6 +155,7 @@ func (ms *Metrics) ListenConfigUpdates(updates <-chan config.Config) {
 			ms.updateAWS(nil)
 			ms.updateGCP(nil)
 			ms.updateOCI(nil)
+			ms.updateAzure(nil)
 		}()
 		for cfg := range updates {
 			var targets []*Target
@@ -166,6 +169,7 @@ func (ms *Metrics) ListenConfigUpdates(updates <-chan config.Config) {
 			if ms.static != nil {
 				ms.updateGCP(ms.static.GCP)
 				ms.updateOCI(ms.static.OCI)
+				ms.updateAzure(ms.static.Azure)
 				targets = append(targets, ms.resolveDatabases(ms.static.Databases)...)
 			}
 			ms.discoverFromConfig(targets)
@@ -428,6 +432,32 @@ func (ms *Metrics) updateOCI(cfg *config.OCIConfig) {
 	}
 }
 
+func (ms *Metrics) updateAzure(cfg *config.AzureConfig) {
+	if ms.azure != nil && (cfg == nil || !ms.azure.Config().Equal(cfg)) { // recreated on a change, as GCP and OCI
+		ms.azure.Stop()
+		ms.azure = nil
+	}
+	if cfg != nil && ms.azure == nil {
+		if d, err := azure.NewDiscoverer(cfg, ms.reg); ms.logCloudError("azure", err) {
+			ms.azure = d
+		}
+	}
+}
+
+// withDefaultParam returns params with key set to value unless it's already set (the TLS mode of the managed databases
+// that require TLS: their endpoints are resolved to IP addresses, so the certificates can't be verified against the host names).
+func withDefaultParam(params map[string]string, key, value string) map[string]string {
+	if params[key] != "" {
+		return params
+	}
+	res := make(map[string]string, len(params)+1)
+	for k, v := range params {
+		res[k] = v
+	}
+	res[key] = value
+	return res
+}
+
 func (ms *Metrics) logCloudError(cloud string, err error) bool {
 	if ms.cloudErrors == nil {
 		ms.cloudErrors = map[string]string{}
@@ -533,6 +563,24 @@ func (ms *Metrics) resolveDatabases(databases []config.Database) []*Target {
 				klog.Warningf("%s: the ElastiCache cluster is not discovered (yet), skipping", description)
 				continue
 			}
+			if ms.aws.ElastiCacheRequiresTLS(d.Elasticache) { // ElastiCache Serverless
+				d.Params = withDefaultParam(d.Params, "tls", "skip-verify")
+			}
+		case d.MemoryDB != "":
+			description = "memorydb:" + d.MemoryDB
+			if ms.aws == nil {
+				klog.Warningf("%s: the AWS integration is not configured, skipping", description)
+				continue
+			}
+			var tls bool
+			endpoints, tls = ms.aws.MemoryDBEndpoints(d.MemoryDB)
+			if len(endpoints) == 0 {
+				klog.Warningf("%s: the MemoryDB cluster is not discovered (yet), skipping", description)
+				continue
+			}
+			if tls {
+				d.Params = withDefaultParam(d.Params, "tls", "skip-verify")
+			}
 		case d.CloudSQL != "":
 			description = "cloudsql:" + d.CloudSQL
 			if ms.gcp == nil {
@@ -591,6 +639,44 @@ func (ms *Metrics) resolveDatabases(databases []config.Database) []*Target {
 			if !ok {
 				klog.Warningf("%s: the cache cluster is not discovered (yet), skipping", description)
 				continue
+			}
+			endpoints = []common.Endpoint{e}
+		case d.AzureDB != "":
+			description = "azuredb:" + d.AzureDB
+			if ms.azure == nil {
+				klog.Warningf("%s: the Azure integration is not configured, skipping", description)
+				continue
+			}
+			e, ok := ms.azure.DBEndpoint(d.Type, d.AzureDB)
+			if !ok {
+				klog.Warningf("%s: the %s flexible server is not discovered (yet), skipping", description, d.Type)
+				continue
+			}
+			// the flexible servers require TLS by default (require_secure_transport)
+			if d.Type == "postgres" {
+				d.Params = withDefaultParam(d.Params, "sslmode", "require")
+			} else {
+				d.Params = withDefaultParam(d.Params, "tls", "skip-verify")
+			}
+			endpoints = []common.Endpoint{e}
+			for _, replica := range ms.azure.DBReplicas(d.Type, d.AzureDB) {
+				if e, ok := ms.azure.DBEndpoint(d.Type, replica); ok {
+					res = append(res, ms.databaseTargets(d, "azuredb:"+replica, []common.Endpoint{e})...)
+				}
+			}
+		case d.AzureRedis != "":
+			description = "azureredis:" + d.AzureRedis
+			if ms.azure == nil {
+				klog.Warningf("%s: the Azure integration is not configured, skipping", description)
+				continue
+			}
+			e, tls, ok := ms.azure.RedisEndpoint(d.AzureRedis)
+			if !ok {
+				klog.Warningf("%s: the cache is not discovered (yet), skipping", description)
+				continue
+			}
+			if tls {
+				d.Params = withDefaultParam(d.Params, "tls", "skip-verify")
 			}
 			endpoints = []common.Endpoint{e}
 		default:

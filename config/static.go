@@ -8,10 +8,11 @@ import (
 )
 
 type Static struct {
-	AWS       *AWSConfig `yaml:"aws"`
-	GCP       *GCPConfig `yaml:"gcp"`
-	OCI       *OCIConfig `yaml:"oci"`
-	Databases []Database `yaml:"databases"`
+	AWS       *AWSConfig   `yaml:"aws"`
+	GCP       *GCPConfig   `yaml:"gcp"`
+	OCI       *OCIConfig   `yaml:"oci"`
+	Azure     *AzureConfig `yaml:"azure"`
+	Databases []Database   `yaml:"databases"`
 }
 
 func LoadStatic(path string) (*Static, error) {
@@ -41,13 +42,16 @@ func (s *Static) Validate() error {
 			return fmt.Errorf("databases[%d]: type is required", i)
 		}
 		sources := 0
-		for _, v := range []string{d.Host, d.RDS, d.Elasticache, d.CloudSQL, d.Memorystore, d.OCIDB, d.OCICache} {
+		for _, v := range []string{d.Host, d.RDS, d.Elasticache, d.CloudSQL, d.Memorystore, d.OCIDB, d.OCICache, d.MemoryDB, d.AzureDB, d.AzureRedis} {
 			if v != "" {
 				sources++
 			}
 		}
 		if sources != 1 {
-			return fmt.Errorf("databases[%d]: exactly one of host, rds, elasticache, cloudsql, memorystore, ocidb or ocicache is required", i)
+			return fmt.Errorf("databases[%d]: exactly one of host, rds, elasticache, memorydb, cloudsql, memorystore, ocidb, ocicache, azuredb or azureredis is required", i)
+		}
+		if d.AzureDB != "" && d.Type != "postgres" && d.Type != "mysql" {
+			return fmt.Errorf("databases[%d]: azuredb requires type postgres or mysql", i)
 		}
 		if d.Host != "" && d.Port == "" {
 			return fmt.Errorf("databases[%d]: port is required with host", i)

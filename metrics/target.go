@@ -15,6 +15,7 @@ import (
 	"github.com/coroot/coroot-cluster-agent/common"
 	"github.com/coroot/coroot-cluster-agent/config"
 	"github.com/coroot/coroot-cluster-agent/k8s"
+	"github.com/coroot/coroot-cluster-agent/metrics/kafka"
 	"github.com/coroot/coroot-cluster-agent/metrics/mongo"
 	"github.com/coroot/coroot-cluster-agent/metrics/mysql"
 	"github.com/coroot/coroot-cluster-agent/metrics/postgres"
@@ -37,6 +38,7 @@ const (
 	TargetTypeRedis     TargetType = "redis"
 	TargetTypeMongodb   TargetType = "mongodb"
 	TargetTypeMemcached TargetType = "memcached"
+	TargetTypeKafka     TargetType = "kafka"
 )
 
 type Credentials struct {
@@ -376,6 +378,13 @@ func (t *Target) newCollector(credentials Credentials, tlsCreds common.TLSCreden
 			nil,
 		)
 		return collector, func() {}, nil
+
+	case TargetTypeKafka:
+		collector, err := kafka.New(t.Addr, credentials.Username, credentials.Password, tlsCreds, t.Params, scrapeInterval, collectTimeout, t.logger)
+		if err != nil {
+			return nil, nil, err
+		}
+		return collector, func() { _ = collector.Close() }, nil
 	}
 	return nil, nil, fmt.Errorf("unsupported target type: %s", t.Type)
 }
@@ -520,6 +529,34 @@ func TargetFromPod(pod *k8s.Pod) *Target {
 		t = &Target{
 			Type: TargetTypeMemcached,
 			Addr: net.JoinHostPort(pod.IP, cmp.Or(pod.Annotations["coroot.com/memcached-scrape-port"], "11211")),
+		}
+	}
+
+	if pod.Annotations["coroot.com/kafka-scrape"] == "true" {
+		t = &Target{
+			Type: TargetTypeKafka,
+			Addr: net.JoinHostPort(pod.IP, cmp.Or(pod.Annotations["coroot.com/kafka-scrape-port"], "9092")),
+			Credentials: Credentials{
+				Username: pod.Annotations["coroot.com/kafka-scrape-credentials-username"],
+				Password: pod.Annotations["coroot.com/kafka-scrape-credentials-password"],
+			},
+			CredentialsSecret: CredentialsSecret{
+				Namespace:   pod.Id.Namespace,
+				Name:        pod.Annotations["coroot.com/kafka-scrape-credentials-secret-name"],
+				UsernameKey: pod.Annotations["coroot.com/kafka-scrape-credentials-secret-username-key"],
+				PasswordKey: pod.Annotations["coroot.com/kafka-scrape-credentials-secret-password-key"],
+			},
+			TLSSecret: tlsSecretFromPod(pod, "kafka"),
+			Params: map[string]string{
+				"sasl":                  pod.Annotations["coroot.com/kafka-scrape-param-sasl"],
+				"tls":                   pod.Annotations["coroot.com/kafka-scrape-param-tls"],
+				"topics":                pod.Annotations["coroot.com/kafka-scrape-param-topics"],
+				"excludeTopics":         pod.Annotations["coroot.com/kafka-scrape-param-exclude-topics"],
+				"consumerGroups":        pod.Annotations["coroot.com/kafka-scrape-param-consumer-groups"],
+				"excludeConsumerGroups": pod.Annotations["coroot.com/kafka-scrape-param-exclude-consumer-groups"],
+				// every annotated broker pod is a target: only the one with the lowest node ID reports the cluster
+				"clusterMetrics": cmp.Or(pod.Annotations["coroot.com/kafka-scrape-param-cluster-metrics"], kafka.ClusterMetricsLowestBroker),
+			},
 		}
 	}
 

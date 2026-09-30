@@ -58,7 +58,7 @@ func (c *Collector) queryActiveStatements(ctx context.Context, prev *activeState
 			}
 		}
 		if obf == "" {
-			obf = obfuscate.Sql(digestText)
+			obf = obfuscate.SqlWithDialect(digestText, obfuscate.DialectMySQL)
 		}
 		snapshot.stmts[k] = activeStmt{
 			qk:         queryKey{schema: schema, query: obf},

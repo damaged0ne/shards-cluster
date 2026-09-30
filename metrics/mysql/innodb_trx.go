@@ -47,7 +47,7 @@ func (c *Collector) queryInnodbTrx(ctx context.Context) (*innodbTrx, error) {
 		if age < minLongTransactionSeconds {
 			continue
 		}
-		label := obfuscate.Sql(query)
+		label := obfuscate.SqlWithDialect(query, obfuscate.DialectMySQL)
 		if label == "" {
 			label = "(idle in transaction)"
 		}

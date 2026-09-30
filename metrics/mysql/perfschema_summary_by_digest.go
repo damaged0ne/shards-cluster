@@ -71,7 +71,7 @@ func (c *Collector) queryStatementsSummary(ctx context.Context, prev *statements
 			}
 		}
 		if r.obfuscatedQueryText == "" {
-			r.obfuscatedQueryText = obfuscate.Sql(digestText)
+			r.obfuscatedQueryText = obfuscate.SqlWithDialect(digestText, obfuscate.DialectMySQL)
 		}
 		snapshot.rows[k] = r
 	}

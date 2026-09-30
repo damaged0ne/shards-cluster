@@ -401,7 +401,7 @@ func (c *Collector) snapshot() {
 		c.dbTracker.client = client
 		c.dbTracker.Track(ctx, c.emitter, c.targetAddr)
 		// Track replaces (never mutates) these after it returns, so they can be published as is.
-		dbSizes, tableGrowth = c.dbTracker.DBSizes, c.dbTracker.TableGrowth
+		dbSizes, tableGrowth = c.dbTracker.Sizes()
 		c.dbTracker.client = nil
 	}
 

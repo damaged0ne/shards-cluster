@@ -64,8 +64,8 @@ func (c *Collector) queryLockWaits(ctx context.Context) (*lockWaits, error) {
 			c.logger.Warning(err)
 			continue
 		}
-		add(lockedTx, lockGroupKey{schema: reqSchema, query: obfuscate.Sql(reqDigest)}, reqTx)
-		add(awaitingTx, lockGroupKey{schema: blkSchema, query: obfuscate.Sql(blkDigest)}, reqTx)
+		add(lockedTx, lockGroupKey{schema: reqSchema, query: obfuscate.SqlWithDialect(reqDigest, obfuscate.DialectMySQL)}, reqTx)
+		add(awaitingTx, lockGroupKey{schema: blkSchema, query: obfuscate.SqlWithDialect(blkDigest, obfuscate.DialectMySQL)}, reqTx)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

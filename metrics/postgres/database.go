@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/coroot/coroot-cluster-agent/metrics/dbtracker"
 	"github.com/coroot/coroot-cluster-agent/schema"
@@ -21,14 +23,16 @@ type databaseTracker struct {
 	trackSizes       bool
 	trackBloat       bool
 	excludeDatabases map[string]bool
+	perDBTimeout     time.Duration
 	logger           logger.Logger
 
+	mu             sync.RWMutex // guards bloat, tableStats and vacuumProgress
 	bloat          map[string]*dbBloat
 	tableStats     map[string][]tableStatEntry
 	vacuumProgress map[string][]vacuumProgressEntry
 }
 
-func newDatabaseTracker(db *sql.DB, baseDSN string, maxTablesPerDB int, trackSchema, trackSizes, trackBloat bool, excludeDatabases []string, logger logger.Logger) *databaseTracker {
+func newDatabaseTracker(db *sql.DB, baseDSN string, maxTablesPerDB int, trackSchema, trackSizes, trackBloat bool, excludeDatabases []string, perDBTimeout time.Duration, logger logger.Logger) *databaseTracker {
 	exclude := make(map[string]bool, len(excludeDatabases))
 	for _, dbName := range excludeDatabases {
 		exclude[dbName] = true
@@ -41,14 +45,31 @@ func newDatabaseTracker(db *sql.DB, baseDSN string, maxTablesPerDB int, trackSch
 		trackSizes:       trackSizes,
 		trackBloat:       trackBloat,
 		excludeDatabases: exclude,
+		perDBTimeout:     perDBTimeout,
 		logger:           logger,
 	}
 	dt.Tracker = dbtracker.NewTracker("postgresql", trackSchema, trackSizes, dt.collectSnapshot, logger)
 	return dt
 }
 
+// withTimeout returns a context with the per-database deadline (if configured).
+func (dt *databaseTracker) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if dt.perDBTimeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, dt.perDBTimeout)
+}
+
+func (dt *databaseTracker) results() (map[string]*dbBloat, map[string][]tableStatEntry, map[string][]vacuumProgressEntry) {
+	dt.mu.RLock()
+	defer dt.mu.RUnlock()
+	return dt.bloat, dt.tableStats, dt.vacuumProgress
+}
+
 func (dt *databaseTracker) collectSnapshot(ctx context.Context) (schema.Snapshot, map[string]*dbtracker.DBSizeSnapshot, error) {
-	databases, dbSizes, err := listDatabasesWithSizes(ctx, dt.db, dt.excludeDatabases)
+	listCtx, listCancel := dt.withTimeout(ctx)
+	databases, dbSizes, err := listDatabasesWithSizes(listCtx, dt.db, dt.excludeDatabases)
+	listCancel()
 	if err != nil {
 		return nil, nil, fmt.Errorf("list databases: %w", err)
 	}
@@ -58,8 +79,14 @@ func (dt *databaseTracker) collectSnapshot(ctx context.Context) (schema.Snapshot
 	tableStats := map[string][]tableStatEntry{}
 	vacuumProgress := map[string][]vacuumProgressEntry{}
 	for _, dbName := range databases {
+		if ctx.Err() != nil {
+			break
+		}
 		dsn := replaceDatabaseInDSN(dt.baseDSN, dbName)
-		tables, b, stats, vac, err := dt.collectDatabase(ctx, dsn, dbName, snapshot)
+		// each database gets its own deadline, so a slow database doesn't starve the next ones
+		dbCtx, dbCancel := dt.withTimeout(ctx)
+		tables, b, stats, vac, err := dt.collectDatabase(dbCtx, dsn, dbName, snapshot)
+		dbCancel()
 		if err != nil {
 			dt.logger.Warning("database tracking for", dbName+":", err)
 			continue
@@ -81,9 +108,11 @@ func (dt *databaseTracker) collectSnapshot(ctx context.Context) (schema.Snapshot
 			}
 		}
 	}
+	dt.mu.Lock()
 	dt.bloat = bloat
 	dt.tableStats = tableStats
 	dt.vacuumProgress = vacuumProgress
+	dt.mu.Unlock()
 	return snapshot, dbSizes, nil
 }
 

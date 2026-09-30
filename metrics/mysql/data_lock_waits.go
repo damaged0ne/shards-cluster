@@ -85,15 +85,14 @@ func toQueryCounts(m map[lockGroupKey]map[uint64]struct{}) []queryCount {
 	return res
 }
 
-func (c *Collector) lockWaitsSnapshot(ctx context.Context) {
-	if c.isMariaDB {
+func (c *Collector) lockWaitsSnapshot(ctx context.Context, st *state) {
+	if st.isMariaDB {
 		return
 	}
 	lw, err := c.queryLockWaits(ctx)
 	if err != nil {
-		c.logger.Warning(err)
-		c.scrapeErrors[err.Error()] = true
+		c.addScrapeError(st, err)
 		return
 	}
-	c.lockWaits = lw
+	st.lockWaits = lw
 }

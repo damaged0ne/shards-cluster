@@ -19,27 +19,25 @@ type binlogStats struct {
 	hasUndo   bool
 }
 
-func (c *Collector) binlogSnapshot(ctx context.Context) {
+func (c *Collector) binlogSnapshot(ctx context.Context, st *state) {
 	stats := &binlogStats{}
-	if v := c.globalVariables["log_bin"]; v == "ON" || v == "1" {
+	if v := st.globalVariables["log_bin"]; v == "ON" || v == "1" {
 		if err := c.queryBinlogSize(ctx, stats); err != nil {
-			c.logger.Warning(err)
-			c.scrapeErrors[err.Error()] = true
+			c.addScrapeError(st, err)
 		} else {
 			stats.hasBinlog = true
 		}
 	} else {
 		stats.hasBinlog = true
 	}
-	if c.hasUndoTablespaces {
+	if st.hasUndoTablespaces {
 		if err := c.queryUndoSize(ctx, stats); err != nil {
-			c.logger.Warning(err)
-			c.scrapeErrors[err.Error()] = true
+			c.addScrapeError(st, err)
 		} else {
 			stats.hasUndo = true
 		}
 	}
-	c.binlogStats = stats
+	st.binlogStats = stats
 }
 
 func (c *Collector) queryBinlogSize(ctx context.Context, stats *binlogStats) error {
@@ -89,19 +87,19 @@ func (c *Collector) queryUndoSize(ctx context.Context, stats *binlogStats) error
 	return c.db.QueryRowContext(ctx, query).Scan(&stats.undoBytes)
 }
 
-func (c *Collector) binlogMetrics(ch chan<- prometheus.Metric) {
-	if c.binlogStats == nil {
+func (st *state) binlogMetrics(ch chan<- prometheus.Metric) {
+	if st.binlogStats == nil {
 		return
 	}
-	if c.binlogStats.hasBinlog {
-		ch <- common.Gauge(dBinlogSize, c.binlogStats.binlogBytes)
-		ch <- common.Gauge(dBinlogFiles, c.binlogStats.binlogFiles)
+	if st.binlogStats.hasBinlog {
+		ch <- common.Gauge(dBinlogSize, st.binlogStats.binlogBytes)
+		ch <- common.Gauge(dBinlogFiles, st.binlogStats.binlogFiles)
 	}
-	if c.binlogStats.hasUndo {
-		ch <- common.Gauge(dUndoSize, c.binlogStats.undoBytes)
+	if st.binlogStats.hasUndo {
+		ch <- common.Gauge(dUndoSize, st.binlogStats.undoBytes)
 	}
-	if !metricFromVariable(ch, dBinlogExpireSeconds, "binlog_expire_logs_seconds", prometheus.GaugeValue, c.globalVariables) {
-		metricFromVariable(ch, dBinlogExpireSeconds, "expire_logs_days", prometheus.GaugeValue, c.globalVariables, daysToSeconds)
+	if !metricFromVariable(ch, dBinlogExpireSeconds, "binlog_expire_logs_seconds", prometheus.GaugeValue, st.globalVariables) {
+		metricFromVariable(ch, dBinlogExpireSeconds, "expire_logs_days", prometheus.GaugeValue, st.globalVariables, daysToSeconds)
 	}
 }
 

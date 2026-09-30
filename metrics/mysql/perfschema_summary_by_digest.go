@@ -92,11 +92,11 @@ type statsWithKey struct {
 	s *queryStats
 }
 
-func (c *Collector) queryMetrics(ch chan<- prometheus.Metric, n int) {
-	if c.perfschemaPrev == nil || c.perfschemaCurr == nil {
+func (st *state) queryMetrics(ch chan<- prometheus.Metric, n int) {
+	if st.perfschemaPrev == nil || st.perfschemaCurr == nil {
 		return
 	}
-	interval := c.perfschemaCurr.ts.Sub(c.perfschemaPrev.ts).Seconds()
+	interval := st.perfschemaCurr.ts.Sub(st.perfschemaPrev.ts).Seconds()
 	if interval <= 0 {
 		return
 	}
@@ -110,8 +110,8 @@ func (c *Collector) queryMetrics(ch chan<- prometheus.Metric, n int) {
 		return r
 	}
 
-	for k, s := range c.perfschemaCurr.rows {
-		prev := c.perfschemaPrev.rows[k]
+	for k, s := range st.perfschemaCurr.rows {
+		prev := st.perfschemaPrev.rows[k]
 		r := getOrCreate(queryKey{schema: k.schema, query: s.obfuscatedQueryText})
 		if calls := s.calls - prev.calls; calls > 0 {
 			r.calls += float64(calls)
@@ -130,31 +130,31 @@ func (c *Collector) queryMetrics(ch chan<- prometheus.Metric, n int) {
 		}
 	}
 
-	if c.activeCurr != nil {
-		for _, st := range c.activeCurr.stmts {
-			d := st.elapsedSec
+	if st.activeCurr != nil {
+		for _, stmt := range st.activeCurr.stmts {
+			d := stmt.elapsedSec
 			if d > interval {
 				d = interval
 			}
 			if d <= 0 {
 				continue
 			}
-			r := getOrCreate(st.qk)
+			r := getOrCreate(stmt.qk)
 			r.totalTime += d
 			r.inflight = true
 		}
 	}
 
-	if c.activePrev != nil && c.activeCurr != nil {
-		for k, st := range c.activePrev.stmts {
-			if _, still := c.activeCurr.stmts[k]; still {
+	if st.activePrev != nil && st.activeCurr != nil {
+		for k, stmt := range st.activePrev.stmts {
+			if _, still := st.activeCurr.stmts[k]; still {
 				continue
 			}
-			r := res[st.qk]
+			r := res[stmt.qk]
 			if r == nil {
 				continue
 			}
-			if r.totalTime -= st.elapsedSec; r.totalTime < 0 {
+			if r.totalTime -= stmt.elapsedSec; r.totalTime < 0 {
 				r.totalTime = 0
 			}
 		}

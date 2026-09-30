@@ -1,8 +1,10 @@
 package aws
 
 import (
+	"context"
 	"net"
 	"strconv"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	ectypes "github.com/aws/aws-sdk-go-v2/service/elasticache/types"
@@ -20,6 +22,7 @@ var (
 )
 
 type ECCollector struct {
+	lock    sync.RWMutex // update is called by the discovery goroutine, Collect by the registry
 	region  string
 	cluster *ectypes.CacheCluster
 	node    *ectypes.CacheNode
@@ -30,34 +33,44 @@ func NewECCollector(region string, cluster *ectypes.CacheCluster, node *ectypes.
 	return &ECCollector{region: region, cluster: cluster, node: node}
 }
 
+func (c *ECCollector) snapshot() (string, *ectypes.CacheCluster, *ectypes.CacheNode, *net.IPAddr) {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return c.region, c.cluster, c.node, c.ip
+}
+
 func (c *ECCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- prometheus.NewDesc("aws_elasticache_collector", "", nil, nil)
 }
 
 func (c *ECCollector) Collect(ch chan<- prometheus.Metric) {
-	ch <- common.Gauge(dECStatus, 1, aws.ToString(c.node.CacheNodeStatus))
+	region, cl, node, ipAddr := c.snapshot()
+	if cl == nil || node == nil {
+		return
+	}
+	ch <- common.Gauge(dECStatus, 1, aws.ToString(node.CacheNodeStatus))
 
-	cluster := aws.ToString(c.cluster.ReplicationGroupId)
+	cluster := aws.ToString(cl.ReplicationGroupId)
 	if cluster == "" {
-		cluster = aws.ToString(c.cluster.CacheClusterId)
+		cluster = aws.ToString(cl.CacheClusterId)
 	}
 	var address, port, ip string
-	if c.node.Endpoint != nil {
-		address = aws.ToString(c.node.Endpoint.Address)
-		port = strconv.Itoa(int(aws.ToInt32(c.node.Endpoint.Port)))
+	if node.Endpoint != nil {
+		address = aws.ToString(node.Endpoint.Address)
+		port = strconv.Itoa(int(aws.ToInt32(node.Endpoint.Port)))
 	}
-	if c.ip != nil {
-		ip = c.ip.String()
+	if ipAddr != nil {
+		ip = ipAddr.String()
 	}
 	ch <- common.Gauge(dECInfo, 1,
-		c.region,
-		aws.ToString(c.node.CustomerAvailabilityZone),
+		region,
+		aws.ToString(node.CustomerAvailabilityZone),
 		address,
 		ip,
 		port,
-		aws.ToString(c.cluster.Engine),
-		aws.ToString(c.cluster.EngineVersion),
-		aws.ToString(c.cluster.CacheNodeType),
+		aws.ToString(cl.Engine),
+		aws.ToString(cl.EngineVersion),
+		aws.ToString(cl.CacheNodeType),
 		cluster,
 	)
 }
@@ -65,15 +78,20 @@ func (c *ECCollector) Collect(ch chan<- prometheus.Metric) {
 func (c *ECCollector) Stop() {
 }
 
-func (c *ECCollector) update(region string, cluster *ectypes.CacheCluster, node *ectypes.CacheNode) {
+func (c *ECCollector) update(ctx context.Context, region string, cluster *ectypes.CacheCluster, node *ectypes.CacheNode) {
+	var ip *net.IPAddr
+	if node.Endpoint != nil {
+		var err error
+		if ip, err = resolveIP(ctx, aws.ToString(node.Endpoint.Address)); err != nil {
+			klog.Errorln(err)
+		}
+	}
+	c.lock.Lock()
+	defer c.lock.Unlock()
 	c.region = region
 	c.cluster = cluster
 	c.node = node
-	if c.node.Endpoint != nil {
-		if ip, err := net.ResolveIPAddr("", aws.ToString(c.node.Endpoint.Address)); err != nil {
-			klog.Errorln(err)
-		} else {
-			c.ip = ip
-		}
+	if ip != nil {
+		c.ip = ip
 	}
 }

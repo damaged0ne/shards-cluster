@@ -50,13 +50,16 @@ var (
 )
 
 type Discoverer struct {
-	cfg     *config.GCPConfig
-	k8s     *k8s.K8S
-	project string
-	region  string // the configured region, the cluster's one by default, or "" for all regions
-	ctx     context.Context
-	reg     prometheus.Registerer
-	stop    chan struct{}
+	cfg      *config.GCPConfig
+	k8s      *k8s.K8S
+	project  string
+	region   string          // the configured region, the cluster's one by default, or "" for all regions
+	ctx      context.Context // cancelled on Stop
+	cancel   context.CancelFunc
+	reg      prometheus.Registerer
+	stop     chan struct{}
+	stopOnce sync.Once
+	done     chan struct{} // closed when the discovery goroutine exits
 
 	sqlClient        *sqladmin.Service
 	redisClient      *redis.Service
@@ -99,38 +102,45 @@ func (d *Discoverer) MemorystoreEndpoints(name string) []common.Endpoint {
 }
 
 func NewDiscoverer(cfg *config.GCPConfig, k8s *k8s.K8S, reg prometheus.Registerer) (*Discoverer, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
 	d := &Discoverer{
 		cfg:    cfg,
 		k8s:    k8s,
 		ctx:    ctx,
+		cancel: cancel,
 		reg:    reg,
 		stop:   make(chan struct{}),
+		done:   make(chan struct{}),
 		errors: map[string]bool{},
 
 		sqlCollectors:   map[string]*CloudSQLCollector{},
 		redisCollectors: map[string]*MemorystoreCollector{},
 	}
 	if err := d.init(); err != nil {
+		cancel()
 		return nil, err
 	}
 	if err := reg.Register(d); err != nil {
+		cancel()
 		return nil, err
 	}
-	go func() {
-		d.discover()
-		t := time.NewTicker(discoveryInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-d.stop:
-				return
-			case <-t.C:
-				d.discover()
-			}
-		}
-	}()
+	go d.run(d.discover)
 	return d, nil
+}
+
+func (d *Discoverer) run(discover func()) {
+	defer close(d.done)
+	discover()
+	t := time.NewTicker(discoveryInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-d.stop:
+			return
+		case <-t.C:
+			discover()
+		}
+	}
 }
 
 func (d *Discoverer) Config() *config.GCPConfig {
@@ -232,19 +242,24 @@ func (d *Discoverer) regionScope() string {
 	return d.region
 }
 
+// Stop is idempotent. It cancels the in-flight API calls, so waiting for the discovery goroutine is short.
 func (d *Discoverer) Stop() {
-	d.stop <- struct{}{}
-	for id, c := range d.sqlCollectors {
-		prometheus.WrapRegistererWith(cloudSQLLabels(id), d.reg).Unregister(c)
-		c.Stop()
-	}
-	for id, c := range d.redisCollectors {
-		prometheus.WrapRegistererWith(memorystoreLabels(id), d.reg).Unregister(c)
-	}
-	d.reg.Unregister(d)
-	if d.valkeyClient != nil {
-		_ = d.valkeyClient.Close()
-	}
+	d.stopOnce.Do(func() {
+		d.cancel()
+		close(d.stop)
+		<-d.done
+		for id, c := range d.sqlCollectors {
+			prometheus.WrapRegistererWith(cloudSQLLabels(id), d.reg).Unregister(c)
+			c.Stop()
+		}
+		for id, c := range d.redisCollectors {
+			prometheus.WrapRegistererWith(memorystoreLabels(id), d.reg).Unregister(c)
+		}
+		d.reg.Unregister(d)
+		if d.valkeyClient != nil {
+			_ = d.valkeyClient.Close()
+		}
+	})
 }
 
 func (d *Discoverer) Describe(ch chan<- *prometheus.Desc) {
@@ -277,6 +292,9 @@ func (d *Discoverer) registerError(err error) {
 func (d *Discoverer) discover() {
 	d.discoverCloudSQL()
 	d.discoverMemorystore()
+	if d.ctx.Err() != nil { // stopped
+		return
+	}
 	d.publishEndpoints()
 	if len(d.sqlCollectors) > 0 || len(d.redisCollectors) > 0 {
 		d.monitoring.refresh(d)
@@ -300,17 +318,21 @@ func (d *Discoverer) publishEndpoints() {
 	sql := map[string]common.Endpoint{}
 	replicas := map[string][]string{}
 	for _, c := range d.sqlCollectors {
-		if ip, port := c.address(); ip != "" {
-			sql[c.instance.Name] = common.Endpoint{Host: ip, Port: port}
+		instance := c.getInstance()
+		if instance == nil {
+			continue
 		}
-		if _, primary, ok := strings.Cut(c.instance.MasterInstanceName, ":"); ok && primary != "" {
-			replicas[primary] = append(replicas[primary], c.instance.Name)
+		if ip, port := cloudSQLAddress(instance); ip != "" {
+			sql[instance.Name] = common.Endpoint{Host: ip, Port: port}
+		}
+		if _, primary, ok := strings.Cut(instance.MasterInstanceName, ":"); ok && primary != "" {
+			replicas[primary] = append(replicas[primary], instance.Name)
 		}
 	}
 	rd := map[string][]common.Endpoint{}
 	for _, c := range d.redisCollectors {
-		if c.info.host != "" {
-			rd[c.info.instance] = append(rd[c.info.instance], common.Endpoint{Host: c.info.host, Port: c.info.port})
+		if info := c.getInfo(); info.host != "" {
+			rd[info.instance] = append(rd[info.instance], common.Endpoint{Host: info.host, Port: info.port})
 		}
 	}
 	d.endpointsLock.Lock()

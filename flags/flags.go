@@ -31,7 +31,7 @@ var (
 
 	CollectKubernetesEvents = kingpin.Flag("collect-kubernetes-events", "Collect and forward Kubernetes events").Envar("COLLECT_KUBERNETES_EVENTS").Default("true").Bool()
 
-	CollectAWSLogs       = kingpin.Flag("collect-aws-logs", "Collect and forward logs of RDS instances discovered through the AWS integration (Postgres)").Envar("COLLECT_AWS_LOGS").Default("true").Bool()
+	CollectAWSLogs       = kingpin.Flag("collect-aws-logs", "Collect and forward logs of RDS instances discovered through the AWS integration (PostgreSQL, MySQL, MariaDB)").Envar("COLLECT_AWS_LOGS").Default("true").Bool()
 	CollectGCPLogs       = kingpin.Flag("collect-gcp-logs", "Collect and forward logs of Cloud SQL instances discovered through the GCP integration").Envar("COLLECT_GCP_LOGS").Default("true").Bool()
 	CollectOCILogs       = kingpin.Flag("collect-oci-logs", "Collect and forward logs of the DB systems discovered through the OCI integration").Envar("COLLECT_OCI_LOGS").Default("true").Bool()
 	TrackDatabaseChanges = kingpin.Flag("track-database-changes", "Track schema and settings changes in databases").Envar("TRACK_DATABASE_CHANGES").Default("true").Bool()

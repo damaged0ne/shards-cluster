@@ -2,6 +2,7 @@ package gcp
 
 import (
 	"strings"
+	"sync"
 
 	"github.com/coroot/coroot-cluster-agent/common"
 	"github.com/coroot/coroot-cluster-agent/flags"
@@ -24,7 +25,9 @@ func (d *Discoverer) discoverCloudSQL() {
 		return nil
 	})
 	if err != nil {
-		d.registerError(err)
+		if d.ctx.Err() == nil {
+			d.registerError(err)
+		}
 		return
 	}
 	byName := map[string]*sqladmin.DatabaseInstance{}
@@ -74,6 +77,7 @@ func userLabels(i *sqladmin.DatabaseInstance) map[string]string {
 
 type CloudSQLCollector struct {
 	discoverer *Discoverer
+	lock       sync.RWMutex // update is called by the discovery goroutine, Collect by the registry
 	instance   *sqladmin.DatabaseInstance
 	logs       *LogReader
 }
@@ -88,7 +92,15 @@ func NewCloudSQLCollector(discoverer *Discoverer, instance *sqladmin.DatabaseIns
 }
 
 func (c *CloudSQLCollector) update(instance *sqladmin.DatabaseInstance) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
 	c.instance = instance
+}
+
+func (c *CloudSQLCollector) getInstance() *sqladmin.DatabaseInstance {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return c.instance
 }
 
 func (c *CloudSQLCollector) Stop() {
@@ -101,9 +113,9 @@ func (c *CloudSQLCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- prometheus.NewDesc("gcp_cloudsql_collector", "", nil, nil)
 }
 
-func (c *CloudSQLCollector) address() (string, string) {
+func cloudSQLAddress(instance *sqladmin.DatabaseInstance) (string, string) {
 	var private, public string
-	for _, ip := range c.instance.IpAddresses {
+	for _, ip := range instance.IpAddresses {
 		switch ip.Type {
 		case "PRIVATE":
 			private = ip.IpAddress
@@ -115,7 +127,7 @@ func (c *CloudSQLCollector) address() (string, string) {
 	if ip == "" {
 		ip = public
 	}
-	engine, _ := cloudSQLEngine(c.instance.DatabaseVersion)
+	engine, _ := cloudSQLEngine(instance.DatabaseVersion)
 	port := ""
 	switch engine {
 	case "postgres":
@@ -129,13 +141,13 @@ func (c *CloudSQLCollector) address() (string, string) {
 }
 
 func (c *CloudSQLCollector) Collect(ch chan<- prometheus.Metric) {
-	i := c.instance
+	i := c.getInstance()
 	if i == nil {
 		return
 	}
 	ch <- common.Gauge(dCloudSQLStatus, 1, i.State)
 	engine, version := cloudSQLEngine(i.DatabaseVersion)
-	ip, port := c.address()
+	ip, port := cloudSQLAddress(i)
 	var tier, availability string
 	if i.Settings != nil {
 		tier = i.Settings.Tier

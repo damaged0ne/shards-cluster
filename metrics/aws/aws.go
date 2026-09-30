@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/elasticache"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
+	rdstypes "github.com/aws/aws-sdk-go-v2/service/rds/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
 	"github.com/coroot/coroot-cluster-agent/common"
@@ -31,6 +33,9 @@ import (
 
 const (
 	discoveryInterval = time.Minute
+	apiTimeout        = 30 * time.Second // per AWS API call, including the retries
+	resolveTimeout    = 5 * time.Second
+	ecTagsTTL         = 10 * time.Minute
 )
 
 var (
@@ -38,25 +43,33 @@ var (
 )
 
 type Discoverer struct {
-	cfg    *config.AWSConfig
-	k8s    *k8s.K8S
-	region string
-	awsCfg aws.Config
-	ctx    context.Context
-	reg    prometheus.Registerer
-	stop   chan struct{}
+	k8s      *k8s.K8S
+	ctx      context.Context // cancelled on Stop
+	cancel   context.CancelFunc
+	reg      prometheus.Registerer
+	stop     chan struct{}
+	stopOnce sync.Once
+	done     chan struct{} // closed when the discovery goroutine exits
 
+	// cfg, region, awsCfg, the clients and identityPending are replaced by Update (the config goroutine)
+	// and read by the discovery goroutine and the collectors' goroutines
+	lock                 sync.RWMutex
+	cfg                  *config.AWSConfig
+	region               string
+	awsCfg               aws.Config
 	rdsClient            *rds.Client
 	elasticacheClient    *elasticache.Client
 	cloudwatchLogsClient *cloudwatchlogs.Client
+	identityPending      bool
 
-	errors          map[string]bool
-	errorsLock      sync.RWMutex
-	lastSummary     string
-	identityPending bool
+	errors      map[string]bool
+	errorsLock  sync.RWMutex
+	lastSummary string
 
+	// accessed only by the discovery goroutine (and by Stop after it has exited)
 	rdsCollectors map[string]*RDSCollector
 	ecCollectors  map[string]*ECCollector
+	ecTags        *tagCache
 
 	endpointsLock sync.RWMutex
 	rdsEndpoints  map[string]common.Endpoint
@@ -87,27 +100,29 @@ func (d *Discoverer) publishEndpoints() {
 	rds := map[string]common.Endpoint{}
 	replicas := map[string][]string{}
 	for _, c := range d.rdsCollectors {
-		if c.instance == nil || c.instance.Endpoint == nil {
+		_, instance, _, _ := c.snapshot()
+		if instance == nil || instance.Endpoint == nil {
 			continue
 		}
-		id := aws.ToString(c.instance.DBInstanceIdentifier)
+		id := aws.ToString(instance.DBInstanceIdentifier)
 		rds[id] = common.Endpoint{
-			Host: aws.ToString(c.instance.Endpoint.Address),
-			Port: strconv.Itoa(int(aws.ToInt32(c.instance.Endpoint.Port))),
+			Host: aws.ToString(instance.Endpoint.Address),
+			Port: strconv.Itoa(int(aws.ToInt32(instance.Endpoint.Port))),
 		}
-		if source := aws.ToString(c.instance.ReadReplicaSourceDBInstanceIdentifier); source != "" {
+		if source := aws.ToString(instance.ReadReplicaSourceDBInstanceIdentifier); source != "" {
 			replicas[source] = append(replicas[source], id)
 		}
 	}
 	ec := map[string][]common.Endpoint{}
 	for _, c := range d.ecCollectors {
-		if c.cluster == nil || c.node == nil || c.node.Endpoint == nil {
+		_, cluster, node, _ := c.snapshot()
+		if cluster == nil || node == nil || node.Endpoint == nil {
 			continue
 		}
-		id := aws.ToString(c.cluster.CacheClusterId)
+		id := aws.ToString(cluster.CacheClusterId)
 		ec[id] = append(ec[id], common.Endpoint{
-			Host: aws.ToString(c.node.Endpoint.Address),
-			Port: strconv.Itoa(int(aws.ToInt32(c.node.Endpoint.Port))),
+			Host: aws.ToString(node.Endpoint.Address),
+			Port: strconv.Itoa(int(aws.ToInt32(node.Endpoint.Port))),
 		})
 	}
 	d.endpointsLock.Lock()
@@ -118,93 +133,126 @@ func (d *Discoverer) publishEndpoints() {
 }
 
 func NewDiscoverer(cfg *config.AWSConfig, k8s *k8s.K8S, reg prometheus.Registerer) (*Discoverer, error) {
-	ctx := context.Background()
-	awsCfg, err := newAWSConfig(ctx, cfg, k8s)
-	if err != nil {
-		return nil, err
-	}
+	ctx, cancel := context.WithCancel(context.Background())
 	d := &Discoverer{
-		cfg:    cfg,
 		k8s:    k8s,
-		region: awsCfg.Region,
-		awsCfg: awsCfg,
 		ctx:    ctx,
+		cancel: cancel,
 		reg:    reg,
 		stop:   make(chan struct{}),
+		done:   make(chan struct{}),
 
 		errors: map[string]bool{},
 
 		rdsCollectors: map[string]*RDSCollector{},
 		ecCollectors:  map[string]*ECCollector{},
+		ecTags:        newTagCache(ecTagsTTL),
 	}
-	d.buildClients()
-
-	err = reg.Register(d)
-	if err != nil {
+	if err := d.setConfig(cfg); err != nil {
+		cancel()
+		return nil, err
+	}
+	if err := reg.Register(d); err != nil {
+		cancel()
 		return nil, err
 	}
 
-	go func() {
-		d.discover()
-		t := time.NewTicker(discoveryInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-d.stop:
-				return
-			case <-t.C:
-				d.discover()
-			}
-		}
-	}()
+	go d.run(d.discover)
 	return d, nil
 }
 
-func (d *Discoverer) buildClients() {
-	d.identityPending = !logIdentity(d.ctx, d.awsCfg)
-	d.rdsClient = rds.NewFromConfig(d.awsCfg)
-	d.elasticacheClient = elasticache.NewFromConfig(d.awsCfg)
-	d.cloudwatchLogsClient = cloudwatchlogs.NewFromConfig(d.awsCfg)
+func (d *Discoverer) run(discover func()) {
+	defer close(d.done)
+	discover()
+	t := time.NewTicker(discoveryInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-d.stop:
+			return
+		case <-t.C:
+			discover()
+		}
+	}
+}
+
+// setConfig builds the AWS config and the clients outside the lock (it may take a while), then swaps them in.
+func (d *Discoverer) setConfig(cfg *config.AWSConfig) error {
+	ctx, cancel := d.apiContext()
+	awsCfg, err := newAWSConfig(ctx, cfg, d.k8s)
+	cancel()
+	if err != nil {
+		return err
+	}
+	identityPending := !logIdentity(d.ctx, awsCfg)
+	rdsClient := rds.NewFromConfig(awsCfg)
+	elasticacheClient := elasticache.NewFromConfig(awsCfg)
+	cloudwatchLogsClient := cloudwatchlogs.NewFromConfig(awsCfg)
+
+	d.lock.Lock()
+	defer d.lock.Unlock()
+	d.cfg = cfg
+	d.awsCfg = awsCfg
+	d.region = awsCfg.Region
+	d.identityPending = identityPending
+	d.rdsClient = rdsClient
+	d.elasticacheClient = elasticacheClient
+	d.cloudwatchLogsClient = cloudwatchLogsClient
+	return nil
+}
+
+// apiContext returns a context for a single AWS API call: bounded by apiTimeout and cancelled on Stop.
+func (d *Discoverer) apiContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(d.ctx, apiTimeout)
+}
+
+func (d *Discoverer) config() (*config.AWSConfig, string) {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+	return d.cfg, d.region
 }
 
 func (d *Discoverer) RDSClient() *rds.Client {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
 	return d.rdsClient
 }
 
 func (d *Discoverer) ElastiCacheClient() *elasticache.Client {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
 	return d.elasticacheClient
 }
 
 func (d *Discoverer) CloudWatchLogsClient() *cloudwatchlogs.Client {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
 	return d.cloudwatchLogsClient
 }
 
+// Stop is idempotent. It cancels the in-flight API calls, so waiting for the discovery goroutine is short.
 func (d *Discoverer) Stop() {
-	d.stop <- struct{}{}
-	for id, c := range d.rdsCollectors {
-		prometheus.WrapRegistererWith(rdsLabels(id), d.reg).Unregister(c)
-		c.Stop()
-	}
-	for id, c := range d.ecCollectors {
-		prometheus.WrapRegistererWith(ecLabels(id), d.reg).Unregister(c)
-		c.Stop()
-	}
-	d.reg.Unregister(d)
+	d.stopOnce.Do(func() {
+		d.cancel()
+		close(d.stop)
+		<-d.done
+		for id, c := range d.rdsCollectors {
+			prometheus.WrapRegistererWith(rdsLabels(id), d.reg).Unregister(c)
+			c.Stop()
+		}
+		for id, c := range d.ecCollectors {
+			prometheus.WrapRegistererWith(ecLabels(id), d.reg).Unregister(c)
+			c.Stop()
+		}
+		d.reg.Unregister(d)
+	})
 }
 
 func (d *Discoverer) Update(cfg *config.AWSConfig) error {
-	if d.cfg.Equal(cfg) {
+	if current, _ := d.config(); current.Equal(cfg) {
 		return nil
 	}
-	awsCfg, err := newAWSConfig(d.ctx, cfg, d.k8s)
-	if err != nil {
-		return err
-	}
-	d.cfg = cfg
-	d.awsCfg = awsCfg
-	d.region = awsCfg.Region
-	d.buildClients()
-	return nil
+	return d.setConfig(cfg)
 }
 
 func (d *Discoverer) Describe(ch chan<- *prometheus.Desc) {
@@ -238,17 +286,28 @@ func (d *Discoverer) discover() {
 	d.errorsLock.Lock()
 	d.errors = map[string]bool{}
 	d.errorsLock.Unlock()
-	if d.identityPending {
-		d.identityPending = !logIdentity(d.ctx, d.awsCfg)
+	d.lock.RLock()
+	identityPending, awsCfg := d.identityPending, d.awsCfg
+	d.lock.RUnlock()
+	if identityPending && logIdentity(d.ctx, awsCfg) {
+		d.lock.Lock()
+		if d.awsCfg.Credentials == awsCfg.Credentials { // not replaced by Update in the meantime
+			d.identityPending = false
+		}
+		d.lock.Unlock()
 	}
-	d.discoverRDS()
-	d.discoverEC()
+	cfg, region := d.config()
+	d.discoverRDS(cfg, region, d.RDSClient())
+	d.discoverEC(cfg, region, d.ElastiCacheClient())
+	if d.ctx.Err() != nil { // stopped
+		return
+	}
 	d.publishEndpoints()
 
 	d.errorsLock.RLock()
 	errs := maps.Keys(d.errors)
 	d.errorsLock.RUnlock()
-	summary := fmt.Sprintf("AWS discovery (region=%s): %d RDS instances, %d ElastiCache nodes", d.region, len(d.rdsCollectors), len(d.ecCollectors))
+	summary := fmt.Sprintf("AWS discovery (region=%s): %d RDS instances, %d ElastiCache nodes", region, len(d.rdsCollectors), len(d.ecCollectors))
 	switch {
 	case len(errs) > 0:
 		klog.Errorf("%s, errors: %s", summary, strings.Join(errs, "; "))
@@ -258,47 +317,43 @@ func (d *Discoverer) discover() {
 	d.lastSummary = summary
 }
 
-func (d *Discoverer) discoverRDS() {
-	svc := d.rdsClient
+func (d *Discoverer) discoverRDS(cfg *config.AWSConfig, region string, svc *rds.Client) {
 	seen := map[string]bool{}
 	paginator := rds.NewDescribeDBInstancesPaginator(svc, &rds.DescribeDBInstancesInput{})
 	for paginator.HasMorePages() {
-		output, err := paginator.NextPage(d.ctx)
+		ctx, cancel := d.apiContext()
+		output, err := paginator.NextPage(ctx)
+		cancel()
 		if err != nil {
 			klog.Error(err)
 			d.registerError(err)
 			break
 		}
 		for _, instance := range output.DBInstances {
-			if filters := d.cfg.RDSTagFilters; len(filters) > 0 {
-				o, err := svc.ListTagsForResource(d.ctx, &rds.ListTagsForResourceInput{ResourceName: instance.DBInstanceArn})
-				if err != nil {
-					klog.Error(err)
-					d.registerError(err)
-					continue
-				}
-				tags := map[string]string{}
-				for _, t := range o.TagList {
-					tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
-				}
+			if filters := cfg.RDSTagFilters; len(filters) > 0 {
+				tags := rdsTags(instance.TagList) // DescribeDBInstances returns the tags, no need for ListTagsForResource
 				if !tagsMatched(filters, tags) {
 					klog.Infof("RDS instance %s (tags: %s) was skipped according to the tag-based filters: %s", aws.ToString(instance.DBInstanceIdentifier), tags, filters)
 					continue
 				}
 			}
-			id := d.region + "/" + aws.ToString(instance.DBInstanceIdentifier)
+			id := region + "/" + aws.ToString(instance.DBInstanceIdentifier)
 			seen[id] = true
 			if d.rdsCollectors[id] == nil {
 				klog.Infoln("new RDS instance found:", id)
-				c := NewRDSCollector(d, d.region, &instance)
+				c := NewRDSCollector(d, region, &instance)
 				if err = prometheus.WrapRegistererWith(rdsLabels(id), d.reg).Register(c); err != nil {
 					klog.Error(err)
+					c.Stop()
 					continue
 				}
 				d.rdsCollectors[id] = c
 			}
-			d.rdsCollectors[id].update(d.region, &instance)
+			d.rdsCollectors[id].update(region, &instance)
 		}
+	}
+	if d.ctx.Err() != nil { // stopped: Stop cleans up the collectors
+		return
 	}
 
 	for id, c := range d.rdsCollectors {
@@ -310,9 +365,9 @@ func (d *Discoverer) discoverRDS() {
 	}
 }
 
-func (d *Discoverer) discoverEC() {
-	svc := d.elasticacheClient
+func (d *Discoverer) discoverEC(cfg *config.AWSConfig, region string, svc *elasticache.Client) {
 	seen := map[string]bool{}
+	d.ecTags.prune()
 	for _, v := range []bool{false, true} {
 		input := &elasticache.DescribeCacheClustersInput{
 			ShowCacheNodeInfo:                       aws.Bool(true),
@@ -320,23 +375,22 @@ func (d *Discoverer) discoverEC() {
 		}
 		paginator := elasticache.NewDescribeCacheClustersPaginator(svc, input)
 		for paginator.HasMorePages() {
-			output, err := paginator.NextPage(d.ctx)
+			ctx, cancel := d.apiContext()
+			output, err := paginator.NextPage(ctx)
+			cancel()
 			if err != nil {
 				klog.Error(err)
 				d.registerError(err)
 				break
 			}
 			for _, cluster := range output.CacheClusters {
-				if filters := d.cfg.ElasticacheTagFilters; len(filters) > 0 {
-					o, err := svc.ListTagsForResource(d.ctx, &elasticache.ListTagsForResourceInput{ResourceName: cluster.ARN})
+				if filters := cfg.ElasticacheTagFilters; len(filters) > 0 {
+					// DescribeCacheClusters doesn't return the tags: they are fetched per cluster and cached
+					tags, err := d.elastiCacheTags(svc, aws.ToString(cluster.ARN))
 					if err != nil {
 						klog.Error(err)
 						d.registerError(err)
 						continue
-					}
-					tags := map[string]string{}
-					for _, t := range o.TagList {
-						tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
 					}
 					if !tagsMatched(filters, tags) {
 						klog.Infof("EC cluster %s (tags: %s) was skipped according to the tag-based filters: %s", aws.ToString(cluster.CacheClusterId), tags, filters)
@@ -344,21 +398,24 @@ func (d *Discoverer) discoverEC() {
 					}
 				}
 				for _, node := range cluster.CacheNodes {
-					id := d.region + "/" + aws.ToString(cluster.CacheClusterId) + "/" + aws.ToString(node.CacheNodeId)
+					id := region + "/" + aws.ToString(cluster.CacheClusterId) + "/" + aws.ToString(node.CacheNodeId)
 					seen[id] = true
 					if d.ecCollectors[id] == nil {
 						klog.Infoln("new EC instance found:", id)
-						c := NewECCollector(d.region, &cluster, &node)
+						c := NewECCollector(region, &cluster, &node)
 						if err = prometheus.WrapRegistererWith(ecLabels(id), d.reg).Register(c); err != nil {
 							klog.Error(err)
 							continue
 						}
 						d.ecCollectors[id] = c
 					}
-					d.ecCollectors[id].update(d.region, &cluster, &node)
+					d.ecCollectors[id].update(d.ctx, region, &cluster, &node)
 				}
 			}
 		}
+	}
+	if d.ctx.Err() != nil { // stopped: Stop cleans up the collectors
+		return
 	}
 
 	for id, c := range d.ecCollectors {
@@ -368,6 +425,96 @@ func (d *Discoverer) discoverEC() {
 			delete(d.ecCollectors, id)
 		}
 	}
+}
+
+func (d *Discoverer) elastiCacheTags(svc *elasticache.Client, arn string) (map[string]string, error) {
+	if tags, ok := d.ecTags.get(arn); ok {
+		return tags, nil
+	}
+	ctx, cancel := d.apiContext()
+	defer cancel()
+	o, err := svc.ListTagsForResource(ctx, &elasticache.ListTagsForResourceInput{ResourceName: aws.String(arn)})
+	if err != nil {
+		return nil, err
+	}
+	tags := map[string]string{}
+	for _, t := range o.TagList {
+		tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
+	}
+	d.ecTags.set(arn, tags)
+	return tags, nil
+}
+
+func rdsTags(tagList []rdstypes.Tag) map[string]string {
+	tags := make(map[string]string, len(tagList))
+	for _, t := range tagList {
+		tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
+	}
+	return tags
+}
+
+// tagCache caches the tags of resources by ARN for ttl.
+type tagCache struct {
+	lock    sync.Mutex
+	ttl     time.Duration
+	now     func() time.Time
+	entries map[string]tagCacheEntry
+}
+
+type tagCacheEntry struct {
+	tags    map[string]string
+	expires time.Time
+}
+
+func newTagCache(ttl time.Duration) *tagCache {
+	return &tagCache{ttl: ttl, now: time.Now, entries: map[string]tagCacheEntry{}}
+}
+
+func (c *tagCache) get(arn string) (map[string]string, bool) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	e, ok := c.entries[arn]
+	if !ok || !c.now().Before(e.expires) {
+		return nil, false
+	}
+	return e.tags, true
+}
+
+func (c *tagCache) set(arn string, tags map[string]string) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.entries[arn] = tagCacheEntry{tags: tags, expires: c.now().Add(c.ttl)}
+}
+
+// prune drops the expired entries, so the tags of the deleted resources don't pile up.
+func (c *tagCache) prune() {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	now := c.now()
+	for arn, e := range c.entries {
+		if !now.Before(e.expires) {
+			delete(c.entries, arn)
+		}
+	}
+}
+
+// resolveIP resolves the host preferring IPv4, as net.ResolveIPAddr does, but honoring ctx.
+func resolveIP(ctx context.Context, host string) (*net.IPAddr, error) {
+	ctx, cancel := context.WithTimeout(ctx, resolveTimeout)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("no addresses found for %s", host)
+	}
+	for _, a := range addrs {
+		if a.IP.To4() != nil {
+			return &a, nil
+		}
+	}
+	return &addrs[0], nil
 }
 
 func rdsLabels(id string) prometheus.Labels {

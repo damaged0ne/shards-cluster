@@ -3,6 +3,7 @@ package oci
 import (
 	"regexp"
 	"strconv"
+	"sync"
 
 	"github.com/coroot/coroot-cluster-agent/common"
 	"github.com/coroot/coroot-cluster-agent/flags"
@@ -33,13 +34,20 @@ type dbInfo struct {
 
 type DBCollector struct {
 	discoverer *Discoverer
+	lock       sync.RWMutex // info and logs are replaced by the discovery goroutine and read by Collect
 	info       dbInfo
 	logs       *LogReader
 }
 
+func (c *DBCollector) snapshot() (dbInfo, *LogReader) {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return c.info, c.logs
+}
+
 func (c *DBCollector) Stop() {
-	if c.logs != nil {
-		c.logs.Stop()
+	if _, logs := c.snapshot(); logs != nil {
+		logs.Stop()
 	}
 }
 
@@ -48,7 +56,7 @@ func (c *DBCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *DBCollector) Collect(ch chan<- prometheus.Metric) {
-	i := c.info
+	i, logs := c.snapshot()
 	ch <- common.Gauge(dDBStatus, 1, i.state)
 	ch <- common.Gauge(dDBInfo, 1,
 		i.name, i.compartment, i.region, i.ad, i.host, i.port, i.engine, i.version, i.shape, strconv.FormatBool(i.highlyAvailable), i.primary,
@@ -64,8 +72,8 @@ func (c *DBCollector) Collect(ch chan<- prometheus.Metric) {
 		c.discoverer.monitoring.collect(i.id, ch)
 	}
 	var counters []logparser.LogCounter
-	if c.logs != nil {
-		counters = c.logs.Counters()
+	if logs != nil {
+		counters = logs.Counters()
 	} else if c.discoverer.logCounters != nil {
 		counters = c.discoverer.logCounters(i.name)
 	}
@@ -83,7 +91,9 @@ func (d *Discoverer) discoverDBSystems() {
 		for _, list := range []func(string) ([]dbInfo, error){d.listMySQL, d.listPostgreSQL} {
 			res, err := list(compartment)
 			if err != nil {
-				d.registerError(err)
+				if d.ctx.Err() == nil {
+					d.registerError(err)
+				}
 				failed = true
 			}
 			found = append(found, res...)
@@ -119,13 +129,18 @@ func (d *Discoverer) discoverDBSystems() {
 				continue
 			}
 			d.dbCollectors[info.id] = c
-		} else if c.logs != nil && info.logSubject != "" && info.logSubject != c.info.logSubject {
-			c.Stop()
-			c.logs = NewLogReader(d, info.logResource, info.logSubject, dbLogService(info.id), "ocidb:"+info.name, *flags.CollectOCILogs)
+		} else if current, logs := c.snapshot(); logs != nil && info.logSubject != "" && info.logSubject != current.logSubject {
+			logs.Stop()
+			logs = NewLogReader(d, info.logResource, info.logSubject, dbLogService(info.id), "ocidb:"+info.name, *flags.CollectOCILogs)
+			c.lock.Lock()
+			c.logs = logs
+			c.lock.Unlock()
 		}
+		c.lock.Lock()
 		c.info = info
+		c.lock.Unlock()
 	}
-	if failed { // a product couldn't be listed: keep its collectors rather than dropping and re-adding them
+	if failed || d.ctx.Err() != nil { // a product couldn't be listed: keep its collectors rather than dropping and re-adding them
 		return
 	}
 	for id, c := range d.dbCollectors {

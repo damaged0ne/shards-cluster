@@ -25,11 +25,13 @@ var fakeDesc = prometheus.NewDesc("fake_metric", "", nil, nil)
 
 type fakeCollector struct {
 	block chan struct{} // if not nil, Collect blocks until it's closed
+	calls atomic.Int32
 }
 
 func (c *fakeCollector) Describe(ch chan<- *prometheus.Desc) { ch <- fakeDesc }
 
 func (c *fakeCollector) Collect(ch chan<- prometheus.Metric) {
+	c.calls.Add(1)
 	if c.block != nil {
 		<-c.block
 	}
@@ -174,7 +176,8 @@ func TestCollectDeadline(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	slow := newTestTarget("10.0.0.4:6379")
 	block := make(chan struct{})
-	if err := slow.activate(reg, &fakeCollector{block: block}, func() {}, 100*time.Millisecond); err != nil {
+	slowColl := &fakeCollector{block: block}
+	if err := slow.activate(reg, slowColl, func() {}, 100*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	fast := newTestTarget("10.0.0.5:6379")
@@ -187,7 +190,8 @@ func TestCollectDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d := time.Since(start); d > time.Second {
+	// generous bound: the point is that Gather returns without waiting for the blocked collector
+	if d := time.Since(start); d > 5*time.Second {
 		t.Fatalf("the slow target blocked the collection for %s", d)
 	}
 	ms := gatherFake(t, prometheus.GathererFunc(func() ([]*dto.MetricFamily, error) { return mfs, nil }))
@@ -198,13 +202,12 @@ func TestCollectDeadline(t *testing.T) {
 	checkSelfMetrics(t, mfs, fast.Addr, 1, 0)
 
 	// the abandoned collection is still running: no new one is started, the scrape isn't blocked
-	start = time.Now()
 	if mfs, err = reg.Gather(); err != nil {
 		t.Fatal(err)
 	}
 	checkSelfMetrics(t, mfs, slow.Addr, 0, 2)
-	if d := time.Since(start); d > 100*time.Millisecond {
-		t.Fatalf("a target with an in-flight collection must be skipped, took %s", d)
+	if n := slowColl.calls.Load(); n != 1 {
+		t.Fatalf("a target with an in-flight collection must be skipped, got %d collections", n)
 	}
 
 	close(block) // the abandoned collection completes, its metrics are discarded

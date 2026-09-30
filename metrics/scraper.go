@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/coroot/coroot-cluster-agent/common"
@@ -29,6 +30,39 @@ const (
 	RemoteFlushDeadline = time.Minute
 	jobName             = "coroot-cluster-agent"
 )
+
+type scraperState struct {
+	cancelDiscovery context.CancelFunc
+	scrapeManager   *scrape.Manager
+	storage         storage.Storage
+	stopping        atomic.Bool
+}
+
+// stopScraper stops the service discovery and the scrape manager.
+func (ms *Metrics) stopScraper(ctx context.Context) {
+	s := ms.scraper
+	if s == nil {
+		return
+	}
+	s.stopping.Store(true)
+	s.cancelDiscovery()
+	if s.scrapeManager != nil {
+		common.RunWithContext(ctx, "stopping scrape manager", s.scrapeManager.Stop)
+	}
+}
+
+// closeStorage closes the WAL and the remote storage, flushing the pending samples (up to RemoteFlushDeadline).
+func (ms *Metrics) closeStorage(ctx context.Context) {
+	s := ms.scraper
+	if s == nil || s.storage == nil {
+		return
+	}
+	common.RunWithContext(ctx, "closing storage", func() {
+		if err := s.storage.Close(); err != nil {
+			klog.Errorln("failed to close storage:", err)
+		}
+	})
+}
 
 func (ms *Metrics) runScraper() error {
 	logger := level.NewFilter(Logger{}, level.AllowInfo())
@@ -82,10 +116,15 @@ func (ms *Metrics) runScraper() error {
 		cfg.ScrapeConfigs = append(cfg.ScrapeConfigs, k8sCfg)
 	}
 
+	discCtx, cancelDiscovery := context.WithCancel(context.Background())
+	state := &scraperState{cancelDiscovery: cancelDiscovery}
+	ms.scraper = state
+
 	localStorage := &readyStorage{stats: tsdb.NewDBStats()}
 	scraper := &readyScrapeManager{}
 	remoteStorage := remote.NewStorage(logger, prometheus.DefaultRegisterer, localStorage.StartTime, ms.walDir, RemoteFlushDeadline, scraper)
 	fanoutStorage := storage.NewFanout(logger, localStorage, remoteStorage)
+	state.storage = fanoutStorage
 
 	if err := remoteStorage.ApplyConfig(&cfg); err != nil {
 		return err
@@ -94,7 +133,7 @@ func (ms *Metrics) runScraper() error {
 	if err != nil {
 		return err
 	}
-	discMgr := discovery.NewManager(context.TODO(), logger, prometheus.DefaultRegisterer, sdMetrics, discovery.Name("scrape"))
+	discMgr := discovery.NewManager(discCtx, logger, prometheus.DefaultRegisterer, sdMetrics, discovery.Name("scrape"))
 	if discMgr == nil {
 		return errors.New("could not create discovery manager")
 	}
@@ -111,7 +150,7 @@ func (ms *Metrics) runScraper() error {
 	}
 
 	go func() {
-		if err = discMgr.Run(); err != nil {
+		if err := discMgr.Run(); err != nil && !state.stopping.Load() {
 			klog.Exitln("error running discovery manager:", err)
 		}
 	}()
@@ -124,6 +163,7 @@ func (ms *Metrics) runScraper() error {
 		return err
 	}
 	scraper.Set(scrapeManager)
+	state.scrapeManager = scrapeManager
 	db, err := agent.Open(logger, prometheus.DefaultRegisterer, remoteStorage, ms.walDir, agent.DefaultOptions())
 	if err != nil {
 		return err
@@ -131,7 +171,7 @@ func (ms *Metrics) runScraper() error {
 	localStorage.Set(db, 0)
 	db.SetWriteNotified(remoteStorage)
 	go func() {
-		if err = scrapeManager.Run(discMgr.SyncCh()); err != nil {
+		if err := scrapeManager.Run(discMgr.SyncCh()); err != nil && !state.stopping.Load() {
 			klog.Exitln("error running scrape manager:", err)
 		}
 	}()
@@ -187,7 +227,7 @@ func k8sDiscovery() *config.ScrapeConfig {
 				Action:       relabel.Replace,
 			},
 			{
-				SourceLabels: model.LabelNames{"__meta_kubernetes_service_annotation_coroot_com_metrics_scheme"},
+				SourceLabels: model.LabelNames{"__meta_kubernetes_pod_annotation_coroot_com_metrics_scheme"},
 				TargetLabel:  "__scheme__",
 				Regex:        relabel.MustNewRegexp("(https?)"),
 				Replacement:  "$1",

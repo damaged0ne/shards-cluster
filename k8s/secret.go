@@ -2,13 +2,18 @@ package k8s
 
 import (
 	"context"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+const secretRequestTimeout = 10 * time.Second
+
 func (k8s *K8S) GetSecret(namespace, name string, keys ...string) (map[string]string, error) {
-	secret, err := k8s.client.CoreV1().Secrets(namespace).Get(context.TODO(), name, metav1.GetOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), secretRequestTimeout)
+	defer cancel()
+	secret, err := k8s.client.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsForbidden(err) {
 			return nil, ErrForbidden

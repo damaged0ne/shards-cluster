@@ -186,7 +186,7 @@ func (s *readyStorage) WALReplayStatus() (tsdb.WALReplayStatus, error) {
 	return tsdb.WALReplayStatus{}, tsdb.ErrNotReady
 }
 
-var ErrNotReady = errors.New("Scrape manager not ready")
+var ErrNotReady = errors.New("scrape manager not ready")
 
 type readyScrapeManager struct {
 	mtx sync.RWMutex

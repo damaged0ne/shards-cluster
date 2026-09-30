@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -22,6 +23,8 @@ import (
 
 const (
 	goCPUProfileSeconds = 10
+	uploadTimeout       = 30 * time.Second
+	dialTimeout         = 10 * time.Second
 )
 
 type Profiles struct {
@@ -39,6 +42,10 @@ type Profiles struct {
 	prevCacheLock sync.Mutex
 
 	k8sPodEvents <-chan k8s.PodEvent
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 func NewProfiles() *Profiles {
@@ -52,14 +59,22 @@ func NewProfiles() *Profiles {
 		apiKey:         *flags.APIKey,
 		scrapeInterval: *flags.ProfilesScrapeInterval,
 		scrapeTimeout:  *flags.ProfilesScrapeTimeout,
+		// every request has its own deadline (see scrape and upload), the transport timeouts bound the connection setup
 		httpClient: &http.Client{
 			Transport: &http.Transport{
-				TLSClientConfig: common.TlsConfig(),
+				TLSClientConfig:       common.TlsConfig(),
+				DialContext:           (&net.Dialer{Timeout: dialTimeout}).DialContext,
+				TLSHandshakeTimeout:   dialTimeout,
+				ResponseHeaderTimeout: uploadTimeout,
+				IdleConnTimeout:       90 * time.Second,
 			},
 		},
 		prevCache: map[ProfileKey]map[uint64]int64{},
 		targets:   map[string]*Target{},
 	}
+
+	ps.ctx, ps.cancel = context.WithCancel(context.Background())
+	ps.done = make(chan struct{})
 
 	klog.Infof("endpoint: %s, scrape interval: %s", ps.endpoint, ps.scrapeInterval)
 
@@ -75,8 +90,24 @@ func (ps *Profiles) Start() {
 	go ps.scrapeLoop()
 }
 
+// Stop cancels in-flight scrapes and uploads and waits for the scrape loop to exit (or ctx to be done).
+func (ps *Profiles) Stop(ctx context.Context) {
+	if ps == nil {
+		return
+	}
+	ps.cancel()
+	select {
+	case <-ps.done:
+	case <-ctx.Done():
+	}
+}
+
 func (ps *Profiles) scrapeLoop() {
+	defer close(ps.done)
 	for {
+		if ps.ctx.Err() != nil {
+			return
+		}
 		start := time.Now()
 		ps.targetsLock.Lock()
 		targets := maps.Values(ps.targets)
@@ -119,7 +150,13 @@ func (ps *Profiles) scrapeLoop() {
 
 		duration := time.Since(start)
 		klog.Infof("scraped %d targets in %s", len(targets), duration.Truncate(time.Millisecond))
-		time.Sleep(ps.scrapeInterval - duration)
+		timer := time.NewTimer(max(ps.scrapeInterval-duration, 0))
+		select {
+		case <-timer.C:
+		case <-ps.ctx.Done():
+			timer.Stop()
+			return
+		}
 	}
 }
 
@@ -132,7 +169,7 @@ func (ps *Profiles) scrape(profileType string, addr *url.URL) (*profile.Profile,
 		q.Set("seconds", strconv.Itoa(goCPUProfileSeconds))
 		u.RawQuery = q.Encode()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(ps.ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
@@ -153,7 +190,48 @@ func (ps *Profiles) scrape(profileType string, addr *url.URL) (*profile.Profile,
 	return p, nil
 }
 
+func sampleHash(s *profile.Sample) uint64 {
+	h := fnv.New64a()
+	for _, location := range s.Location {
+		for _, line := range location.Line {
+			if line.Function == nil {
+				continue
+			}
+			_, _ = h.Write([]byte(line.Function.Name))
+			_, _ = h.Write([]byte(line.Function.Filename))
+			_, _ = h.Write([]byte(strconv.FormatInt(line.Line, 10)))
+		}
+	}
+	return h.Sum64()
+}
+
+// dedupSamples merges the samples with the same stack, summing all their values (every sample type) at once.
+func dedupSamples(p *profile.Profile) map[uint64]*profile.Sample {
+	samples := make(map[uint64]*profile.Sample, len(p.Sample))
+	for _, s := range p.Sample {
+		hash := sampleHash(s)
+		if existing := samples[hash]; existing == nil {
+			samples[hash] = s
+		} else {
+			for i := range existing.Value {
+				if i < len(s.Value) {
+					existing.Value[i] += s.Value[i]
+				}
+			}
+		}
+	}
+	if len(samples) < len(p.Sample) {
+		p.Sample = p.Sample[:0]
+		for _, s := range samples {
+			p.Sample = append(p.Sample, s)
+		}
+		p.Compact()
+	}
+	return samples
+}
+
 func (ps *Profiles) diff(serviceName string, labels Labels, source Source, profileType string, p *profile.Profile) {
+	samples := dedupSamples(p)
 	for i, st := range p.SampleType {
 		cumulative := false
 		switch profileType {
@@ -174,62 +252,29 @@ func (ps *Profiles) diff(serviceName string, labels Labels, source Source, profi
 
 		st.Type = fmt.Sprintf("%s:%s_%s:%s", source, profileType, st.Type, st.Unit)
 
-		samples := map[uint64]*profile.Sample{}
-		for _, s := range p.Sample {
-			h := fnv.New64a()
-			for _, location := range s.Location {
-				for _, line := range location.Line {
-					if line.Function == nil {
-						continue
-					}
-					_, _ = h.Write([]byte(line.Function.Name))
-					_, _ = h.Write([]byte(line.Function.Filename))
-					_, _ = h.Write([]byte(fmt.Sprintf("%d", line.Line)))
-				}
-			}
-			hash := h.Sum64()
-			if samples[hash] == nil {
-				samples[hash] = s
-			} else {
-				samples[hash].Value[i] += s.Value[i]
-			}
-		}
-
-		if len(samples) < len(p.Sample) {
-			p.Sample = p.Sample[:0]
-			for _, s := range samples {
-				p.Sample = append(p.Sample, s)
-			}
-			p.Compact()
-		}
-
 		if !cumulative {
 			continue
 		}
 
-		hasPrev := true
 		key := ProfileKey{
 			ServiceName: serviceName,
 			LabelsHash:  labels.Hash(),
 			ProfileType: st.Type,
 		}
+		current := make(map[uint64]int64, len(samples))
 		ps.prevCacheLock.Lock()
-		if ps.prevCache[key] == nil {
-			ps.prevCache[key] = map[uint64]int64{}
-			hasPrev = false
-		}
+		prev, hasPrev := ps.prevCache[key]
 		for hash, s := range samples {
 			value := s.Value[i]
-			prev := ps.prevCache[key][hash]
-			ps.prevCache[key][hash] = value
+			current[hash] = value
 			if !hasPrev {
 				continue
 			}
-			if value-prev >= 0 {
-				value -= prev
+			if d := value - prev[hash]; d >= 0 {
+				s.Value[i] = d
 			}
-			s.Value[i] = value
 		}
+		ps.prevCache[key] = current // only the stacks seen in this scrape are kept, so the cache doesn't grow unbounded
 		ps.prevCacheLock.Unlock()
 	}
 }
@@ -249,7 +294,9 @@ func (ps *Profiles) upload(serviceName string, labels Labels, p *profile.Profile
 		return err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, u.String(), buf)
+	ctx, cancel := context.WithTimeout(ps.ctx, uploadTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), buf)
 	if err != nil {
 		return err
 	}
@@ -275,35 +322,42 @@ func (ps *Profiles) upload(serviceName string, labels Labels, p *profile.Profile
 
 func (ps *Profiles) discoverFromPods() {
 	for e := range ps.k8sPodEvents {
-		switch e.Type {
-		case k8s.PodEventTypeAdd, k8s.PodEventTypeChange:
-			target := TargetFromPod(e.Pod)
-			if target == nil {
-				if t := TargetFromPod(e.Old); t != nil {
-					ps.delTarget(t)
-				}
-				continue
-			}
-			ps.targetsLock.Lock()
-			t := ps.targets[target.Address]
-			ps.targetsLock.Unlock()
-			switch {
-			case t == nil:
-				ps.addTarget(target)
-			case t.Equal(target):
-				continue
-			default:
-				ps.delTarget(t)
-				ps.addTarget(target)
-			}
+		ps.handlePodEvent(e)
+	}
+}
 
-		case k8s.PodEventTypeDelete:
-			target := TargetFromPod(e.Pod)
-			if target == nil {
-				continue
+func (ps *Profiles) handlePodEvent(e k8s.PodEvent) {
+	switch e.Type {
+	case k8s.PodEventTypeAdd, k8s.PodEventTypeChange:
+		target := TargetFromPod(e.Pod)
+		old := TargetFromPod(e.Old)
+		if target == nil {
+			if old != nil {
+				ps.delTarget(old)
 			}
-			ps.delTarget(target)
+			return
 		}
+		if old != nil && old.Address != target.Address { // e.g. the pod IP has changed
+			ps.delTarget(old)
+		}
+		ps.targetsLock.Lock()
+		t := ps.targets[target.Address]
+		ps.targetsLock.Unlock()
+		switch {
+		case t == nil:
+			ps.addTarget(target)
+		case t.Equal(target) && t.podKey == target.podKey:
+			return
+		default:
+			ps.replaceTarget(t, target)
+		}
+
+	case k8s.PodEventTypeDelete:
+		target := TargetFromPod(e.Pod)
+		if target == nil {
+			return
+		}
+		ps.delTarget(target)
 	}
 }
 
@@ -314,21 +368,36 @@ func (ps *Profiles) addTarget(target *Target) {
 	ps.targets[target.Address] = target
 }
 
+func (ps *Profiles) replaceTarget(old, target *Target) {
+	ps.targetsLock.Lock()
+	defer ps.targetsLock.Unlock()
+	ps.forgetTarget(old)
+	klog.Infof("new target: %s", target)
+	ps.targets[target.Address] = target
+}
+
+// delTarget removes the target stored for target.Address only if it was discovered from the same pod,
+// so that the removal of a pod doesn't remove the target of another pod that has reused its IP address.
 func (ps *Profiles) delTarget(target *Target) {
 	ps.targetsLock.Lock()
 	defer ps.targetsLock.Unlock()
-
 	t := ps.targets[target.Address]
-	if t != nil {
-		labelsHash := t.Labels.Hash()
-		ps.prevCacheLock.Lock()
-		defer ps.prevCacheLock.Unlock()
-		for key := range ps.prevCache {
-			if t.ServiceName == key.ServiceName && labelsHash == key.LabelsHash {
-				delete(ps.prevCache, key)
-			}
+	if t == nil || t.podKey != target.podKey {
+		return
+	}
+	ps.forgetTarget(t)
+	delete(ps.targets, target.Address)
+}
+
+// forgetTarget drops the cached state of t; must be called with targetsLock held.
+func (ps *Profiles) forgetTarget(t *Target) {
+	klog.Infof("removing target: %s", t)
+	labelsHash := t.Labels.Hash()
+	ps.prevCacheLock.Lock()
+	defer ps.prevCacheLock.Unlock()
+	for key := range ps.prevCache {
+		if t.ServiceName == key.ServiceName && labelsHash == key.LabelsHash {
+			delete(ps.prevCache, key)
 		}
 	}
-	klog.Infof("removing target: %s", target)
-	delete(ps.targets, target.Address)
 }

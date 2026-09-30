@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coroot/coroot-cluster-agent/common"
@@ -25,6 +26,7 @@ import (
 	redis "github.com/oliver006/redis_exporter/exporter"
 	"github.com/prometheus/client_golang/prometheus"
 	memcached "github.com/prometheus/memcached_exporter/pkg/exporter"
+	"k8s.io/klog"
 )
 
 type TargetType string
@@ -69,22 +71,25 @@ type Target struct {
 	LogService                   string // the service the logs read from the database server (e.g. the MySQL error log) are forwarded as, if any
 	DiscoveredFromPodAnnotations bool
 
-	coll     prometheus.Collector
-	collLock sync.Mutex
-	stop     func()
-	logger   logger.Logger
+	// podKey identifies the pod the target was discovered from (UID, or namespace/name as a fallback);
+	// empty for targets that don't come from pod annotations.
+	podKey string
+
+	coll           prometheus.Collector
+	stop           func()
+	collectTimeout time.Duration
+	collLock       sync.Mutex
+
+	collecting atomic.Bool   // a collection (possibly an abandoned one that outlived its deadline) is in flight
+	timeouts   atomic.Uint64 // collections abandoned at the deadline or skipped because the previous one was still running
+
+	logger logger.Logger
 }
 
 func (t *Target) collector() prometheus.Collector {
 	t.collLock.Lock()
 	defer t.collLock.Unlock()
 	return t.coll
-}
-
-func (t *Target) setCollector(c prometheus.Collector) {
-	t.collLock.Lock()
-	defer t.collLock.Unlock()
-	t.coll = c
 }
 
 func (t *Target) Equal(other *Target) bool {
@@ -101,12 +106,89 @@ func (t *Target) Describe(ch chan<- *prometheus.Desc) {
 	ch <- prometheus.NewDesc("exporter", "", nil, nil)
 }
 
+var (
+	targetCollectDurationDesc = prometheus.NewDesc(
+		"coroot_cluster_agent_target_collect_duration_seconds",
+		"Duration of the last metrics collection from the database target",
+		[]string{"target_type"}, nil,
+	)
+	targetCollectSuccessDesc = prometheus.NewDesc(
+		"coroot_cluster_agent_target_collect_success",
+		"Whether the last metrics collection from the database target completed within the deadline (1) or not (0)",
+		[]string{"target_type"}, nil,
+	)
+	targetCollectTimeoutsDesc = prometheus.NewDesc(
+		"coroot_cluster_agent_target_collect_timeouts_total",
+		"Total number of metrics collections from the database target that were abandoned because they exceeded the deadline",
+		[]string{"target_type"}, nil,
+	)
+)
+
+const collectBufferSize = 1024
+
+// Collect runs the collector of the target with a deadline, so that a slow or unresponsive database
+// cannot hold up the whole /metrics response (and thus the metrics of all other targets).
+// Metrics produced after the deadline are dropped; the abandoned collection keeps running in the background
+// until it finishes on its own, and no new collection is started for the target until then.
 func (t *Target) Collect(ch chan<- prometheus.Metric) {
-	if coll := t.collector(); coll != nil {
-		start := time.Now()
-		coll.Collect(ch)
-		t.logger.Info("metrics collection completed in", time.Since(start).Truncate(time.Millisecond))
+	t.collLock.Lock()
+	coll, timeout := t.coll, t.collectTimeout
+	t.collLock.Unlock()
+	if coll == nil {
+		return
 	}
+	start := time.Now()
+	success := collectWithDeadline(coll, ch, timeout, &t.collecting)
+	duration := time.Since(start)
+	if success {
+		klog.V(2).Infof("%s: metrics collection completed in %s", t, duration.Truncate(time.Millisecond))
+	} else {
+		t.timeouts.Add(1)
+		t.logger.Warningf("metrics collection did not complete within %s, the metrics of this target are skipped", timeout)
+	}
+	tt := string(t.Type)
+	ch <- prometheus.MustNewConstMetric(targetCollectDurationDesc, prometheus.GaugeValue, duration.Seconds(), tt)
+	ch <- prometheus.MustNewConstMetric(targetCollectSuccessDesc, prometheus.GaugeValue, boolToFloat(success), tt)
+	ch <- prometheus.MustNewConstMetric(targetCollectTimeoutsDesc, prometheus.CounterValue, float64(t.timeouts.Load()), tt)
+}
+
+// collectWithDeadline forwards the metrics of coll to ch until coll.Collect returns or the timeout expires.
+// It returns false if the collection was abandoned at the deadline or was not started because a previous
+// collection (tracked by inFlight) is still running.
+func collectWithDeadline(coll prometheus.Collector, ch chan<- prometheus.Metric, timeout time.Duration, inFlight *atomic.Bool) bool {
+	if !inFlight.CompareAndSwap(false, true) {
+		return false
+	}
+	buf := make(chan prometheus.Metric, collectBufferSize)
+	go func() {
+		defer inFlight.Store(false)
+		defer close(buf)
+		coll.Collect(buf)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case m, ok := <-buf:
+			if !ok {
+				return true
+			}
+			ch <- m
+		case <-timer.C:
+			go func() { // let the abandoned collection finish, discarding its metrics
+				for range buf {
+				}
+			}()
+			return false
+		}
+	}
+}
+
+func boolToFloat(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func (t *Target) Labels() prometheus.Labels {
@@ -121,11 +203,44 @@ func (t *Target) IsExporterStarted() bool {
 	return t.collector() != nil
 }
 
-func (t *Target) StartExporter(reg *prometheus.Registry, credentials Credentials, tlsCreds common.TLSCredentials, scrapeInterval, scrapeTimeout time.Duration, changeEmitter *emitter.ChangeEmitter, maxTablesPerDB int, trackSizes, trackBloat bool, excludeDatabases []string) error {
+func (t *Target) StartExporter(reg prometheus.Registerer, credentials Credentials, tlsCreds common.TLSCredentials, scrapeInterval, scrapeTimeout time.Duration, changeEmitter *emitter.ChangeEmitter, maxTablesPerDB int, trackSizes, trackBloat bool, excludeDatabases []string) error {
 	collectTimeout := scrapeTimeout - time.Second
 	if collectTimeout <= 0 {
 		collectTimeout = time.Second
 	}
+	coll, stop, err := t.newCollector(credentials, tlsCreds, scrapeInterval, collectTimeout, changeEmitter, maxTablesPerDB, trackSizes, trackBloat, excludeDatabases)
+	if err != nil {
+		return err
+	}
+	return t.activate(reg, coll, stop, collectTimeout)
+}
+
+// activate registers the target and only then makes the collector visible to Collect and StopExporter.
+// If the registration fails (e.g. another target with the same address is still registered),
+// the collector is stopped so that no connection pools or background goroutines are leaked,
+// and the target stays not-started so it is retried later.
+func (t *Target) activate(reg prometheus.Registerer, coll prometheus.Collector, stop func(), collectTimeout time.Duration) error {
+	if err := prometheus.WrapRegistererWith(t.Labels(), reg).Register(t); err != nil {
+		stop()
+		return err
+	}
+	t.collLock.Lock()
+	t.coll = coll
+	t.stop = stop
+	t.collectTimeout = collectTimeout
+	t.collLock.Unlock()
+	return nil
+}
+
+var tlsConfigSeq atomic.Uint64
+
+// tlsConfigName returns a name for a driver-global TLS config that is unique per exporter start,
+// so that stopping an old exporter of the same address can't deregister the config of a new one.
+func (t *Target) tlsConfigName() string {
+	return fmt.Sprintf("coroot-%s-%d", t.Addr, tlsConfigSeq.Add(1))
+}
+
+func (t *Target) newCollector(credentials Credentials, tlsCreds common.TLSCredentials, scrapeInterval, collectTimeout time.Duration, changeEmitter *emitter.ChangeEmitter, maxTablesPerDB int, trackSizes, trackBloat bool, excludeDatabases []string) (prometheus.Collector, func(), error) {
 	caCert := tlsCreds.CA
 	switch t.Type {
 
@@ -139,11 +254,11 @@ func (t *Target) StartExporter(reg *prometheus.Registry, credentials Credentials
 		if tlsCreds.CA != "" || (tlsCreds.Cert != "" && tlsCreds.Key != "") {
 			cfg, err := common.DatabaseTLSConfig(tlsCreds, false)
 			if err != nil {
-				return err
+				return nil, nil, err
 			}
-			pqTLSName = "coroot-" + t.Addr
+			pqTLSName = t.tlsConfigName()
 			if err = pq.RegisterTLSConfig(pqTLSName, cfg); err != nil {
-				return err
+				return nil, nil, err
 			}
 			sslmode = "pqgo-" + pqTLSName
 		}
@@ -157,56 +272,56 @@ func (t *Target) StartExporter(reg *prometheus.Registry, credentials Credentials
 			if pqTLSName != "" {
 				_ = pq.RegisterTLSConfig(pqTLSName, nil)
 			}
-			return err
+			return nil, nil, err
 		}
-		t.setCollector(collector)
-		t.stop = func() {
+		return collector, func() {
 			_ = collector.Close()
 			if pqTLSName != "" {
 				_ = pq.RegisterTLSConfig(pqTLSName, nil)
 			}
-		}
+		}, nil
 
 	case TargetTypeMysql:
-		userPass := fmt.Sprintf("%s:%s", credentials.Username, credentials.Password)
-		query := url.Values{}
-		query.Set("timeout", fmt.Sprintf("%dms", collectTimeout.Milliseconds()))
 		tlsParam := t.Params["tls"]
 		tlsConfigName := ""
 		if (caCert != "" || (tlsCreds.Cert != "" && tlsCreds.Key != "")) && tlsParam != "false" {
 			cfg, err := common.DatabaseTLSConfig(tlsCreds, tlsParam == "skip-verify")
 			if err != nil {
-				return err
+				return nil, nil, err
 			}
-			tlsConfigName = "coroot-" + t.Addr
+			tlsConfigName = t.tlsConfigName()
 			if err = gomysql.RegisterTLSConfig(tlsConfigName, cfg); err != nil {
-				return err
+				return nil, nil, err
 			}
 			tlsParam = tlsConfigName
 		}
 		if tlsParam == "" {
 			tlsParam = "false"
 		}
-		query.Set("tls", tlsParam)
-		dsn := fmt.Sprintf("%s@tcp(%s)/?%s", userPass, t.Addr, query.Encode())
+		dsn, err := mysqlDSN(credentials, t.Addr, collectTimeout, tlsParam)
+		if err != nil {
+			if tlsConfigName != "" {
+				gomysql.DeregisterTLSConfig(tlsConfigName)
+			}
+			return nil, nil, err
+		}
 		collector, err := mysql.New(dsn, t.logger, scrapeInterval, collectTimeout,
 			changeEmitter, t.Addr, maxTablesPerDB, trackSizes, excludeDatabases)
 		if err != nil {
 			if tlsConfigName != "" {
 				gomysql.DeregisterTLSConfig(tlsConfigName)
 			}
-			return err
+			return nil, nil, err
 		}
 		if t.LogService != "" {
 			collector.StartErrorLog(t.LogService, t.Description)
 		}
-		t.setCollector(collector)
-		t.stop = func() {
+		return collector, func() {
 			_ = collector.Close()
 			if tlsConfigName != "" {
 				gomysql.DeregisterTLSConfig(tlsConfigName)
 			}
-		}
+		}, nil
 
 	case TargetTypeRedis:
 		opts := redis.Options{
@@ -232,10 +347,9 @@ func (t *Target) StartExporter(reg *prometheus.Registry, credentials Credentials
 		dsn := fmt.Sprintf("%s://%s", scheme, t.Addr)
 		collector, err := redis.NewRedisExporter(dsn, opts)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
-		t.setCollector(collector)
-		t.stop = func() {}
+		return collector, func() {}, nil
 
 	case TargetTypeMongodb:
 		collector := mongo.New(
@@ -252,8 +366,7 @@ func (t *Target) StartExporter(reg *prometheus.Registry, credentials Credentials
 			maxTablesPerDB,
 			trackSizes,
 		)
-		t.setCollector(collector)
-		t.stop = func() { _ = collector.Close() }
+		return collector, func() { _ = collector.Close() }, nil
 
 	case TargetTypeMemcached:
 		collector := memcached.New(
@@ -262,23 +375,41 @@ func (t *Target) StartExporter(reg *prometheus.Registry, credentials Credentials
 			level.NewFilter(&promLogger{l: t.logger}, level.AllowInfo()),
 			nil,
 		)
-		t.setCollector(collector)
-		t.stop = func() {}
-
-	default:
-		return fmt.Errorf("unsupported target type: %s", t.Type)
+		return collector, func() {}, nil
 	}
-
-	return prometheus.WrapRegistererWith(t.Labels(), reg).Register(t)
+	return nil, nil, fmt.Errorf("unsupported target type: %s", t.Type)
 }
 
-func (t *Target) StopExporter(reg *prometheus.Registry) {
-	if t.collector() != nil {
-		prometheus.WrapRegistererWith(t.Labels(), reg).Unregister(t)
-		if t.stop != nil {
-			t.stop()
-		}
-		t.setCollector(nil)
+// mysqlDSN builds the DSN with the driver's own formatter, so that credentials containing
+// special characters in the password ('@', ':', '/', ...) and '@' in the username are handled correctly.
+// The DSN format can't represent a username containing ':' (the driver splits user:password at the first ':').
+func mysqlDSN(credentials Credentials, addr string, timeout time.Duration, tlsParam string) (string, error) {
+	if strings.Contains(credentials.Username, ":") {
+		return "", fmt.Errorf("mysql usernames containing ':' are not supported")
+	}
+	cfg := gomysql.NewConfig()
+	cfg.User = credentials.Username
+	cfg.Passwd = credentials.Password
+	cfg.Net = "tcp"
+	cfg.Addr = addr
+	cfg.Timeout = timeout
+	cfg.TLSConfig = tlsParam
+	return cfg.FormatDSN(), nil
+}
+
+// StopExporter unregisters the target and stops its collector. It is idempotent and safe to call concurrently
+// with StartExporter: only a successfully registered exporter is ever visible here.
+func (t *Target) StopExporter(reg prometheus.Registerer) {
+	t.collLock.Lock()
+	coll, stop := t.coll, t.stop
+	t.coll, t.stop = nil, nil
+	t.collLock.Unlock()
+	if coll == nil {
+		return
+	}
+	prometheus.WrapRegistererWith(t.Labels(), reg).Unregister(t)
+	if stop != nil {
+		stop()
 	}
 }
 
@@ -394,6 +525,7 @@ func TargetFromPod(pod *k8s.Pod) *Target {
 
 	if t != nil {
 		t.DiscoveredFromPodAnnotations = true
+		t.podKey = pod.Key()
 		t.Description = fmt.Sprintf("ns=%s, pod=%s, node=%s", pod.Id.Namespace, pod.Id.Name, pod.Id.NodeName)
 		t.logger = logger.NewKlog(t.String())
 	}

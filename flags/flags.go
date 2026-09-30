@@ -40,6 +40,9 @@ var (
 	MaxTablesPerDatabase = kingpin.Flag("max-tables-per-database", "Skip databases with more tables than this limit").Envar("MAX_TABLES_PER_DATABASE").Default("1000").Int()
 	ConfigFile           = kingpin.Flag("config-file", "Path to a YAML file with static configuration (AWS, GCP and OCI integration settings and databases to monitor), merged with the configuration received from Coroot").Envar("CONFIG_FILE").String()
 	ExcludeDatabases     = kingpin.Flag("exclude-databases", "Databases to exclude from monitoring: no schema, size, connection or query statistics are collected for them").Envar("EXCLUDE_DATABASES").Default("rdsadmin", "cloudsqladmin", "mysql", "information_schema", "performance_schema", "sys", "mysql_innodb_cluster_metadata", "mysql_innodb_cluster_metadata_previous").Strings()
+
+	EnablePprof     = kingpin.Flag("enable-pprof", "Expose the Go profiling endpoints (/debug/pprof/) on the listen address").Envar("ENABLE_PPROF").Default("false").Bool()
+	ShutdownTimeout = kingpin.Flag("shutdown-timeout", "Maximum time to wait for a graceful shutdown (flushing metrics and logs) after SIGTERM/SIGINT").Envar("SHUTDOWN_TIMEOUT").Default("20s").Duration()
 )
 
 func init() {

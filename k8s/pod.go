@@ -25,6 +25,7 @@ type PodId struct {
 type Pod struct {
 	// update Pod.Equal when adding fields
 	Id          PodId
+	UID         string
 	Phase       corev1.PodPhase
 	IP          string
 	Annotations map[string]string
@@ -49,6 +50,7 @@ func podFromObj(obj any) *Pod {
 			Namespace: pod.Namespace,
 			NodeName:  pod.Spec.NodeName,
 		},
+		UID:         string(pod.UID),
 		Phase:       pod.Status.Phase,
 		IP:          pod.Status.PodIP,
 		Annotations: pod.Annotations,
@@ -69,10 +71,23 @@ func (p *Pod) Running() bool {
 
 func (p *Pod) Equal(other *Pod) bool {
 	return p.Id == other.Id &&
+		p.UID == other.UID &&
 		p.Phase == other.Phase &&
 		p.IP == other.IP &&
 		maps.Equal(p.Annotations, other.Annotations) &&
 		slices.Equal(p.Ports, other.Ports)
+}
+
+// Key identifies the pod instance: its UID, or namespace/name if the UID is unknown.
+// Unlike the IP address, it is never reused by another pod.
+func (p *Pod) Key() string {
+	if p == nil {
+		return ""
+	}
+	if p.UID != "" {
+		return p.UID
+	}
+	return p.Id.Namespace + "/" + p.Id.Name
 }
 
 func (p *Pod) ServiceName() string {

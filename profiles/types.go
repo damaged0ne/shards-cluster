@@ -61,6 +61,8 @@ type Target struct {
 
 	Description string
 
+	podKey string // the pod the target was discovered from
+
 	logger logger.Logger
 }
 
@@ -96,6 +98,7 @@ func TargetFromPod(pod *k8s.Pod) *Target {
 
 	if t != nil {
 		t.Description = fmt.Sprintf("ns=%s, pod=%s, node=%s", pod.Id.Namespace, pod.Id.Name, pod.Id.NodeName)
+		t.podKey = pod.Key()
 		t.logger = logger.NewKlog(t.String())
 	}
 

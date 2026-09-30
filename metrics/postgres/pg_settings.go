@@ -4,9 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/coroot/coroot-cluster-agent/metrics/dbtracker"
 	"github.com/coroot/coroot-cluster-agent/schema"
 	"github.com/pmezard/go-difflib/difflib"
 )
@@ -62,6 +65,56 @@ func (c *Collector) getSettings(ctx context.Context) ([]Setting, error) {
 	return res, nil
 }
 
+// conninfoPasswordRe matches password-like keywords (password, sslpassword, ...) in a
+// keyword/value connection string together with their value (quoted or bare).
+var conninfoPasswordRe = regexp.MustCompile(`(?i)(\b\w*password\s*=\s*)('(?:[^'\\]|\\.)*'?|\S*)`)
+
+// redactConninfo strips passwords from a libpq connection string (both the
+// keyword/value and the URI forms), keeping the remaining keys intact.
+func redactConninfo(ci string) string {
+	if strings.HasPrefix(ci, "postgres://") || strings.HasPrefix(ci, "postgresql://") {
+		u, err := url.Parse(ci)
+		if err != nil {
+			return dbtracker.RedactedValue
+		}
+		if u.User != nil {
+			if _, ok := u.User.Password(); ok {
+				u.User = url.UserPassword(u.User.Username(), "redacted")
+			}
+		}
+		q := u.Query()
+		changed := false
+		for k := range q {
+			if strings.Contains(strings.ToLower(k), "password") {
+				q.Set(k, "redacted")
+				changed = true
+			}
+		}
+		if changed {
+			u.RawQuery = q.Encode()
+		}
+		return u.String()
+	}
+	return conninfoPasswordRe.ReplaceAllString(ci, "${1}"+dbtracker.RedactedValue)
+}
+
+// redactSetting returns a value of the setting safe to be shipped outside the agent.
+func redactSetting(name, value string) string {
+	if value == "" {
+		return value
+	}
+	n := strings.ToLower(name)
+	switch {
+	case strings.Contains(n, "conninfo"): // primary_conninfo
+		return redactConninfo(value)
+	case strings.HasSuffix(n, "_command"): // archive_command, restore_command, archive_cleanup_command, ssl_passphrase_command, ...
+		return dbtracker.RedactedValue
+	case dbtracker.IsSensitiveSettingName(n):
+		return dbtracker.RedactedValue
+	}
+	return value
+}
+
 func settingsToText(settings []Setting) string {
 	var buf strings.Builder
 	for _, s := range settings {
@@ -72,13 +125,13 @@ func settingsToText(settings []Setting) string {
 		if s.Context == "internal" {
 			continue
 		}
-		fmt.Fprintf(&buf, "%s = %s\n", s.Name, s.RawValue)
+		fmt.Fprintf(&buf, "%s = %s\n", s.Name, redactSetting(s.Name, s.RawValue))
 	}
 	return buf.String()
 }
 
-func (c *Collector) trackSettingsChanges() {
-	curr := settingsToText(c.settings)
+func (c *Collector) trackSettingsChanges(settings []Setting) {
+	curr := settingsToText(settings)
 	if c.prevSettingsText != "" && curr != c.prevSettingsText {
 		diff, _ := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
 			A:        difflib.SplitLines(c.prevSettingsText),

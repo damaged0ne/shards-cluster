@@ -22,9 +22,9 @@ type archiverStats struct {
 	lastFailed   sql.Null[time.Time]
 }
 
-func (c *Collector) getWalStats(ctx context.Context, version semver.Version) error {
-	if err := c.db.QueryRowContext(ctx, `SELECT COALESCE(sum(size), 0) FROM pg_ls_waldir()`).Scan(&c.walSize); err != nil {
-		c.walSize = sql.Null[float64]{}
+func (c *Collector) getWalStats(ctx context.Context, version semver.Version, st *pgState) error {
+	if err := c.db.QueryRowContext(ctx, `SELECT COALESCE(sum(size), 0) FROM pg_ls_waldir()`).Scan(&st.walSize); err != nil {
+		st.walSize = sql.Null[float64]{}
 		c.logger.Warning(err)
 	}
 
@@ -32,10 +32,10 @@ func (c *Collector) getWalStats(ctx context.Context, version semver.Version) err
 	if err := c.db.QueryRowContext(ctx, `SELECT archived_count, last_archived_time, failed_count, last_failed_time FROM pg_stat_archiver`).Scan(&a.archived, &a.lastArchived, &a.failed, &a.lastFailed); err != nil {
 		c.logger.Warning(err)
 	} else if c.archPrev != nil {
-		c.archArchived += delta(c.archPrev.archived, a.archived)
-		c.archFailed += delta(c.archPrev.failed, a.failed)
+		st.archArchived += delta(c.archPrev.archived, a.archived)
+		st.archFailed += delta(c.archPrev.failed, a.failed)
 	}
-	c.archStats = a
+	st.archStats = a
 	c.archPrev = a
 
 	slotQuery := `SELECT slot_name, active, '' AS wal_status, pg_wal_lsn_diff(CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_lsn() END, restart_lsn) FROM pg_replication_slots`
@@ -44,7 +44,7 @@ func (c *Collector) getWalStats(ctx context.Context, version semver.Version) err
 	}
 	rows, err := c.db.QueryContext(ctx, slotQuery)
 	if err != nil {
-		c.replicationSlots = nil
+		st.replicationSlots = nil
 		return err
 	}
 	defer rows.Close()
@@ -57,6 +57,6 @@ func (c *Collector) getWalStats(ctx context.Context, version semver.Version) err
 		}
 		slots = append(slots, s)
 	}
-	c.replicationSlots = slots
+	st.replicationSlots = slots
 	return nil
 }

@@ -20,15 +20,14 @@ type groupReplication struct {
 	conflicts    float64
 }
 
-func (c *Collector) groupReplicationSnapshot(ctx context.Context) {
+func (c *Collector) groupReplicationSnapshot(ctx context.Context, st *state) {
 	gr, err := c.queryGroupReplication(ctx)
 	if err != nil {
-		c.logger.Warning(err)
-		c.scrapeErrors[err.Error()] = true
-		c.groupReplication = nil
+		c.addScrapeError(st, err)
+		st.groupReplication = nil
 		return
 	}
-	c.groupReplication = gr
+	st.groupReplication = gr
 }
 
 func (c *Collector) queryGroupReplication(ctx context.Context) (*groupReplication, error) {
@@ -74,8 +73,8 @@ func (c *Collector) queryGroupReplication(ctx context.Context) (*groupReplicatio
 	return gr, nil
 }
 
-func (c *Collector) groupReplicationMetrics(ch chan<- prometheus.Metric) {
-	gr := c.groupReplication
+func (st *state) groupReplicationMetrics(ch chan<- prometheus.Metric) {
+	gr := st.groupReplication
 	if gr == nil || gr.size == 0 {
 		return
 	}

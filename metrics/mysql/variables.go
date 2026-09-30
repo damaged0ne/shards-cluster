@@ -2,12 +2,12 @@ package mysql
 
 import "context"
 
-func (c *Collector) updateVariables(ctx context.Context, query string, dest map[string]string) error {
+func (c *Collector) queryVariables(ctx context.Context, query string) (map[string]string, error) {
 	rows, err := c.db.QueryContext(ctx, query)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	clear(dest)
+	dest := map[string]string{}
 	defer rows.Close()
 	for rows.Next() {
 		var name, value string
@@ -17,5 +17,5 @@ func (c *Collector) updateVariables(ctx context.Context, query string, dest map[
 		}
 		dest[name] = value
 	}
-	return nil
+	return dest, rows.Err()
 }

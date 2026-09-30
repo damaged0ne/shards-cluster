@@ -33,7 +33,7 @@ func (s *checkpointStats) completed() int64 {
 	return t
 }
 
-func (c *Collector) getCheckpointStats(ctx context.Context, version semver.Version) error {
+func (c *Collector) getCheckpointStats(ctx context.Context, version semver.Version, st *pgState) error {
 	query := `SELECT checkpoints_timed, checkpoints_req, NULL, NULL, buffers_checkpoint FROM pg_stat_bgwriter`
 	switch {
 	case semver.MustParseRange(">=18.0.0")(version):
@@ -47,22 +47,22 @@ func (c *Collector) getCheckpointStats(ctx context.Context, version semver.Versi
 	}
 	if err := c.db.QueryRowContext(ctx,
 		`SELECT pg_wal_lsn_diff(CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_lsn() END, redo_lsn) FROM pg_control_checkpoint()`,
-	).Scan(&c.cpWalBytes); err != nil {
-		c.cpWalBytes = sql.Null[float64]{}
+	).Scan(&st.cpWalBytes); err != nil {
+		st.cpWalBytes = sql.Null[float64]{}
 		c.logger.Warning(err)
 	}
 	if c.cpPrev != nil {
-		c.cpTimed += delta(c.cpPrev.timed, s.timed)
-		c.cpRequested += delta(c.cpPrev.requested, s.requested)
+		st.cpTimed += delta(c.cpPrev.timed, s.timed)
+		st.cpRequested += delta(c.cpPrev.requested, s.requested)
 		if s.done.Valid {
-			c.cpDone += delta(c.cpPrev.done, s.done)
+			st.cpDone += delta(c.cpPrev.done, s.done)
 		} else {
-			c.cpDone += delta(c.cpPrev.timed, s.timed) + delta(c.cpPrev.requested, s.requested)
+			st.cpDone += delta(c.cpPrev.timed, s.timed) + delta(c.cpPrev.requested, s.requested)
 		}
-		c.cpRestartsDone += delta(c.cpPrev.restartsDone, s.restartsDone)
-		c.cpBuffers += delta(c.cpPrev.buffersWritten, s.buffersWritten)
+		st.cpRestartsDone += delta(c.cpPrev.restartsDone, s.restartsDone)
+		st.cpBuffers += delta(c.cpPrev.buffersWritten, s.buffersWritten)
 		if s.completed() > c.cpPrev.completed() {
-			c.lastCheckpointAt = time.Now()
+			st.lastCheckpointAt = time.Now()
 		}
 	}
 	c.cpPrev = s

@@ -24,8 +24,8 @@ func (rs *ReplicaStatus) Get(keys ...string) string {
 	return ""
 }
 
-func (c *Collector) updateReplicationStatus(ctx context.Context) error {
-	c.replicaStatuses = c.replicaStatuses[:0]
+func (c *Collector) updateReplicationStatus(ctx context.Context, st *state) error {
+	st.replicaStatuses = nil // never reuse the published slice
 	for _, q := range []string{"SHOW REPLICA STATUS", "SHOW SLAVE STATUS"} {
 		if c.invalidQueries[q] {
 			continue
@@ -51,27 +51,27 @@ func (c *Collector) updateReplicationStatus(ctx context.Context) error {
 			if err = rows.Scan(scanArgs...); err != nil {
 				return err
 			}
-			st := &ReplicaStatus{vals: map[string]string{}}
+			rs := &ReplicaStatus{vals: map[string]string{}}
 			for i, col := range cols {
 				raw, ok := scanArgs[i].(*sql.RawBytes)
 				if !ok {
 					continue
 				}
-				st.vals[col] = string(*raw)
+				rs.vals[col] = string(*raw)
 			}
-			c.replicaStatuses = append(c.replicaStatuses, st)
+			st.replicaStatuses = append(st.replicaStatuses, rs)
 		}
 		break
 	}
 	return nil
 }
 
-func (c *Collector) replicationMetrics(ch chan<- prometheus.Metric) {
-	for _, st := range c.replicaStatuses {
-		sourceServerId := st.Get("Source_Server_Id", "Master_Server_Id")
-		sourceServerUUID := st.Get("Source_UUID", "Master_UUID")
+func (st *state) replicationMetrics(ch chan<- prometheus.Metric) {
+	for _, rs := range st.replicaStatuses {
+		sourceServerId := rs.Get("Source_Server_Id", "Master_Server_Id")
+		sourceServerUUID := rs.Get("Source_UUID", "Master_UUID")
 
-		if ioRunning := st.Get("Replica_IO_Running", "Slave_IO_Running"); ioRunning != "" {
+		if ioRunning := rs.Get("Replica_IO_Running", "Slave_IO_Running"); ioRunning != "" {
 			status := 0.
 			if ioRunning == "Yes" {
 				status = 1.
@@ -81,11 +81,11 @@ func (c *Collector) replicationMetrics(ch chan<- prometheus.Metric) {
 				status,
 				sourceServerId,
 				sourceServerUUID,
-				st.Get("Replica_IO_State", "Slave_IO_State"),
-				st.Get("Last_IO_Error"),
+				rs.Get("Replica_IO_State", "Slave_IO_State"),
+				rs.Get("Last_IO_Error"),
 			)
 		}
-		if sqlRunning := st.Get("Replica_SQL_Running", "Slave_SQL_Running"); sqlRunning != "" {
+		if sqlRunning := rs.Get("Replica_SQL_Running", "Slave_SQL_Running"); sqlRunning != "" {
 			status := 0.
 			if sqlRunning == "Yes" {
 				status = 1.
@@ -95,11 +95,11 @@ func (c *Collector) replicationMetrics(ch chan<- prometheus.Metric) {
 				status,
 				sourceServerId,
 				sourceServerUUID,
-				st.Get("Replica_SQL_Running_State", "Slave_SQL_Running_State"),
-				st.Get("Last_SQL_Error"),
+				rs.Get("Replica_SQL_Running_State", "Slave_SQL_Running_State"),
+				rs.Get("Last_SQL_Error"),
 			)
 		}
-		if lag, err := strconv.ParseUint(st.Get("Seconds_Behind_Source", "Seconds_Behind_Master"), 10, 64); err == nil {
+		if lag, err := strconv.ParseUint(rs.Get("Seconds_Behind_Source", "Seconds_Behind_Master"), 10, 64); err == nil {
 			ch <- common.Gauge(dReplicationLag, float64(lag), sourceServerId, sourceServerUUID)
 		}
 	}

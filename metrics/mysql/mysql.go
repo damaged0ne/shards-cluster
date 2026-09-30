@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"maps"
 	"regexp"
 	"slices"
 	"sort"
@@ -49,6 +50,8 @@ type state struct {
 	replicaStatuses  []*ReplicaStatus
 	ioByTablePrev    *ioByTableSnapshot
 	ioByTableCurr    *ioByTableSnapshot
+	waitEvents       []waitEvent
+	applierLag       map[string]*applierLag
 
 	isMariaDB          bool
 	isGalera           bool
@@ -187,8 +190,18 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- common.Gauge(dInfo, 1, version, st.globalVariables["server_id"], st.globalVariables["server_uuid"])
 	}
 
-	if len(st.scrapeErrors) > 0 {
-		for e := range st.scrapeErrors {
+	warnings := st.scrapeErrors
+	if c.dbTracker != nil {
+		if trackerErrors := c.dbTracker.errorReasons(); len(trackerErrors) > 0 {
+			warnings = maps.Clone(warnings)
+			if warnings == nil {
+				warnings = map[string]bool{}
+			}
+			maps.Copy(warnings, trackerErrors)
+		}
+	}
+	if len(warnings) > 0 {
+		for e := range warnings {
 			ch <- common.Gauge(dScrapeError, 1, "", e)
 		}
 	} else {
@@ -206,7 +219,10 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	}
 	st.innodbTrxMetrics(ch)
 	st.replicationMetrics(ch)
+	st.applierLagMetrics(ch)
+	st.waitEventsMetrics(ch)
 	c.tableSizeMetrics(ch)
+	c.unusedIndexMetrics(ch)
 	metricFromVariable(ch, dConnectionsMax, "max_connections", prometheus.GaugeValue, st.globalVariables)
 	metricFromVariable(ch, dConnectionsCurrent, "Threads_connected", prometheus.GaugeValue, st.globalStatus)
 	metricFromVariable(ch, dConnectionsTotal, "Connections", prometheus.CounterValue, st.globalStatus)
@@ -270,6 +286,8 @@ func (c *Collector) snapshot() {
 		c.addScrapeError(&st, err)
 		return
 	}
+	c.applierLagSnapshot(ctx, &st)
+	c.waitEventsSnapshot(ctx, &st)
 	st.perfschemaPrev = st.perfschemaCurr
 	st.perfschemaCurr, err = c.queryStatementsSummary(ctx, st.perfschemaPrev)
 	if err != nil {
@@ -385,6 +403,25 @@ func (c *Collector) tableSizeMetrics(ch chan<- prometheus.Metric) {
 	}
 	for _, g := range tableGrowth {
 		ch <- common.Gauge(dTableSizeGrowth, g.Growth, g.DB, g.Table)
+	}
+}
+
+func (c *Collector) unusedIndexMetrics(ch chan<- prometheus.Metric) {
+	if c.dbTracker == nil {
+		return
+	}
+	u := c.dbTracker.indexResults()
+	if u == nil {
+		return
+	}
+	for schemaName, count := range u.bySchema {
+		ch <- common.Gauge(dSchemaUnusedIndexes, count, schemaName)
+	}
+	for _, ix := range u.top {
+		ch <- common.Gauge(dIndexUnused, 1, ix.schema, ix.table, ix.index)
+		if ix.size.Valid {
+			ch <- common.Gauge(dIndexUnusedBytes, ix.size.Float64, ix.schema, ix.table, ix.index)
+		}
 	}
 }
 

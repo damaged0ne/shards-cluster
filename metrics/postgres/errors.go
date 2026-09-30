@@ -8,11 +8,17 @@ import (
 	"github.com/lib/pq"
 )
 
+// errViewNotFound is returned when an optional view/extension is detected to be missing.
+var errViewNotFound = errors.New("view not found")
+
 // errorReason maps an error to one of a small fixed set of reasons suitable for use
 // as a metric label value. The full error message must be logged separately.
 func errorReason(err error) string {
 	if err == nil {
 		return ""
+	}
+	if errors.Is(err, errViewNotFound) {
+		return dbtracker.ErrorReasonNotFound
 	}
 	var pqErr *pq.Error
 	if errors.As(err, &pqErr) {

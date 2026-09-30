@@ -274,3 +274,85 @@ func BenchmarkSql(b *testing.B) {
 		Sql(query)
 	}
 }
+
+func TestSqlNoLeaks(t *testing.T) {
+	for _, c := range []struct {
+		dialect Dialect
+		in, out string
+	}{
+		{
+			dialect: DialectMySQL,
+			in:      `UPDATE users SET password = "hunter2secret" WHERE id = 1`,
+			out:     `update users set password = ? where id = ?`,
+		},
+		{
+			dialect: DialectMySQL,
+			in:      `SELECT * FROM t WHERE note = 'it\'s my SSN 123-45-6789 secretword' AND b = 1`,
+			out:     `select * from t where note = ? and b = ?`,
+		},
+		{
+			dialect: DialectMySQL,
+			in:      `SELECT * FROM t WHERE a = "x\"secret\"y" AND b = 'p\\' AND c = 'q''secret'`,
+			out:     `select * from t where a = ? and b = ? and c = ?`,
+		},
+		{
+			dialect: DialectMySQL,
+			in:      "SELECT `pass\"word` FROM t WHERE token = 0xDEADBEEFCAFE # secret comment\n AND bits = 0b0101",
+			out:     "select `pass\"word` from t where token = ? and bits = ?",
+		},
+		{
+			dialect: DialectMySQL,
+			in:      `SELECT x'DEADBEEF', X'CAFE', b'0101', N'secretname', _utf8mb4'secretname'`,
+			out:     `select ?, ?, ?, n?, _utf?mb??`,
+		},
+		{
+			dialect: DialectMySQL,
+			in:      `SELECT * FROM t WHERE a = "unterminated secret`,
+			out:     `select * from t where a = ?`,
+		},
+		{
+			dialect: DialectPostgres,
+			in:      `SELECT $tag$topsecret$tag$, $a$ x $b$ y $a$, $$z$$ FROM t WHERE id = $1`,
+			out:     `select ?, ?, ? from t where id = ?`,
+		},
+		{
+			dialect: DialectPostgres,
+			in:      `SELECT $Tag$ secret $tag$ still secret $Tag$`,
+			out:     `select ?`,
+		},
+		{
+			dialect: DialectPostgres,
+			in:      `SELECT $body$ unterminated secret`,
+			out:     `select ?`,
+		},
+		{
+			dialect: DialectPostgres,
+			in:      `SELECT "it's" FROM t WHERE token = 0xDEADBEEF AND a = 'secret'`,
+			out:     `select "it's" from t where token = ? and a = ?`,
+		},
+		{
+			dialect: DialectPostgres,
+			in:      `SELECT E'it\'s \\ secret' , X'FF', B'01'`,
+			out:     `select ?, ?, ?`,
+		},
+		{
+			dialect: DialectPostgres,
+			in:      `SELECT 'C:\', 'secret'`,
+			out:     `select ?, ?`,
+		},
+		{
+			dialect: DialectPostgres,
+			in:      `SELECT 1 /*/ secret */ FROM t`,
+			out:     `select ? from t`,
+		},
+		{
+			dialect: DialectPostgres,
+			in:      `SELECT a$b$c FROM t`,
+			out:     `select a $ b $ c from t`,
+		},
+	} {
+		assert.Equal(t, c.out, SqlWithDialect(c.in, c.dialect), c.in)
+	}
+	// Sql keeps the PostgreSQL rules
+	assert.Equal(t, `select "hunter?secret"`, Sql(`SELECT "hunter2secret"`))
+}

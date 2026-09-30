@@ -2,11 +2,13 @@ package mongo
 
 import (
 	"context"
+	"maps"
 	"time"
 
 	"github.com/coroot/coroot-cluster-agent/common"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
 )
 
 type ticketStats struct {
@@ -243,21 +245,28 @@ func newServerStatusCounters() serverStatusCounters {
 	}
 }
 
-func (c *Collector) collectServerStatus(ctx context.Context) error {
-	res := c.client.Database("admin").RunCommand(ctx, bson.D{{Key: "serverStatus", Value: 1}})
+func (s serverStatusCounters) clone() serverStatusCounters {
+	s.opcounters = maps.Clone(s.opcounters)
+	s.opLatencySeconds = maps.Clone(s.opLatencySeconds)
+	s.opLatencyOps = maps.Clone(s.opLatencyOps)
+	return s
+}
+
+// collectServerStatus accumulates the counters into c.ssTotals, which is private to the snapshot goroutine.
+func (c *Collector) collectServerStatus(ctx context.Context, client *mongo.Client) (*serverStatus, error) {
+	res := client.Database("admin").RunCommand(ctx, bson.D{{Key: "serverStatus", Value: 1}})
 	ss := &serverStatus{}
 	if err := res.Decode(ss); err != nil {
-		return err
+		return nil, err
 	}
 
 	prev := c.ssPrev
 	c.ssPrev = ss
-	c.ss = ss
 	if prev == nil {
-		return nil
+		return ss, nil
 	}
 
-	cnt := &c.ssCounters
+	cnt := &c.ssTotals
 
 	for _, m := range []struct {
 		dst *float64
@@ -307,11 +316,11 @@ func (c *Collector) collectServerStatus(ctx context.Context) error {
 		}
 	}
 
-	if c.lastCheckpointAt.IsZero() || ss.checkpointCount() > prev.checkpointCount() {
-		c.journalBytesAtCheckpoint = ss.journalBytes()
-		c.lastCheckpointAt = time.Now()
+	if c.ckptAt.IsZero() || ss.checkpointCount() > prev.checkpointCount() {
+		c.ckptJournalBytes = ss.journalBytes()
+		c.ckptAt = time.Now()
 	}
-	return nil
+	return ss, nil
 }
 
 func delta[T int64 | float64](prev, cur T) float64 {

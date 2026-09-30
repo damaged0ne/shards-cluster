@@ -2,7 +2,9 @@ package mongo
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -103,14 +105,19 @@ type Collector struct {
 	cancelFunc context.CancelFunc
 
 	host       string
-	client     *mongo.Client
 	clientOpts *options.ClientOptions
 	clientLock sync.Mutex
+	client     *clientRef // guarded by clientLock
+	closed     bool       // guarded by clientLock
+	done       chan struct{}
 	logger     logger.Logger
 
 	scrapeInterval time.Duration
 	collectTimeout time.Duration
 
+	// The fields below are the published state read by Collect. They are guarded by lock
+	// and written only by the snapshot goroutine, which builds new values without holding
+	// the lock and swaps them in at the end of each snapshot.
 	lock         sync.RWMutex
 	scrapeErrors map[string]bool
 
@@ -121,7 +128,6 @@ type Collector struct {
 	rsConfig   *ReplConfig
 	oplog      *OplogStats
 	ss         *serverStatus
-	ssPrev     *serverStatus
 	ssCounters serverStatusCounters
 
 	journalBytesAtCheckpoint float64
@@ -130,16 +136,37 @@ type Collector struct {
 	currentOp  *CurrentOpStats
 	topQueries []TopQuery
 
-	profilerLastTs  map[string]time.Time
 	profilingLevels map[string]int64
-	profilerPrevAt  time.Time
-	profilerWindow  []profilerInterval
+
+	dbSizes     map[string]*dbtracker.DBSizeSnapshot
+	tableGrowth []dbtracker.TableGrowthEntry
+
+	// The fields below are private to the snapshot goroutine.
+	ssPrev           *serverStatus
+	ssTotals         serverStatusCounters
+	ckptJournalBytes float64
+	ckptAt           time.Time
+
+	profilerLastTs map[string]time.Time
+	profilerPrevAt time.Time
+	profilerWindow []profilerInterval
 
 	dbTracker        *databaseTracker
 	emitter          dbtracker.ChangeEmitter
 	targetAddr       string
 	prevSettingsText string
 }
+
+// clientRef is a reference-counted mongo client. A client that failed a ping is retired
+// (replaced by a new one on the next use) and disconnected only after its last user releases it,
+// so a snapshot running concurrently with Collect never operates on a nil or disconnected client.
+type clientRef struct {
+	client  *mongo.Client
+	refs    int  // guarded by Collector.clientLock
+	retired bool // guarded by Collector.clientLock
+}
+
+var errCollectorClosed = errors.New("mongo collector is closed")
 
 func New(host, username, password string, tlsCreds common.TLSCredentials, params map[string]string, scrapeInterval, collectTimeout time.Duration,
 	logger logger.Logger, emitter dbtracker.ChangeEmitter, targetAddr string,
@@ -154,9 +181,11 @@ func New(host, username, password string, tlsCreds common.TLSCredentials, params
 		scrapeInterval: scrapeInterval,
 		collectTimeout: collectTimeout,
 		scrapeErrors:   map[string]bool{},
+		done:           make(chan struct{}),
 		emitter:        emitter,
 		targetAddr:     targetAddr,
 		ssCounters:     newServerStatusCounters(),
+		ssTotals:       newServerStatusCounters(),
 		profilerLastTs: map[string]time.Time{},
 	}
 	c.clientOpts = options.Client().
@@ -190,7 +219,9 @@ func New(host, username, password string, tlsCreds common.TLSCredentials, params
 		c.dbTracker = newDatabaseTracker(maxTablesPerDB, trackSchema, trackSizes, logger)
 	}
 	go func() {
+		defer close(c.done)
 		ticker := time.NewTicker(scrapeInterval)
+		defer ticker.Stop()
 		c.snapshot()
 		for {
 			select {
@@ -205,37 +236,87 @@ func New(host, username, password string, tlsCreds common.TLSCredentials, params
 	return c
 }
 
-func (c *Collector) connectAndPing(ctx context.Context) error {
+func (c *Collector) acquireClient(ctx context.Context) (*clientRef, error) {
 	c.clientLock.Lock()
 	defer c.clientLock.Unlock()
-	var err error
+	if c.closed {
+		return nil, errCollectorClosed
+	}
 	if c.client == nil {
 		c.logger.Info("connecting to mongodb")
-		if c.client, err = mongo.Connect(ctx, c.clientOpts); err != nil {
-			return err
+		client, err := mongo.Connect(ctx, c.clientOpts)
+		if err != nil {
+			return nil, err
 		}
+		c.client = &clientRef{client: client}
 	}
-	if err = c.client.Ping(ctx, nil); err != nil {
-		_ = c.client.Disconnect(ctx)
+	c.client.refs++
+	return c.client, nil
+}
+
+// retireClientLocked must be called with clientLock held. It reports whether the client
+// is no longer used and must be disconnected by the caller.
+func (c *Collector) retireClientLocked(ref *clientRef) bool {
+	if c.client == ref {
 		c.client = nil
-		return err
 	}
-	return nil
+	ref.retired = true
+	return ref.refs == 0
+}
+
+func (c *Collector) releaseClient(ref *clientRef) {
+	c.clientLock.Lock()
+	ref.refs--
+	disconnect := ref.retired && ref.refs == 0
+	c.clientLock.Unlock()
+	if disconnect {
+		c.disconnect(ref)
+	}
+}
+
+func (c *Collector) disconnect(ref *clientRef) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.collectTimeout)
+	defer cancel()
+	return ref.client.Disconnect(ctx)
+}
+
+// connectAndPing returns a pinged client reference that the caller must release with releaseClient.
+func (c *Collector) connectAndPing(ctx context.Context) (*clientRef, error) {
+	ref, err := c.acquireClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err = ref.client.Ping(ctx, nil); err != nil {
+		c.clientLock.Lock()
+		c.retireClientLocked(ref)
+		c.clientLock.Unlock()
+		c.releaseClient(ref)
+		return nil, err
+	}
+	return ref, nil
 }
 
 func (c *Collector) Close() error {
 	c.cancelFunc()
+	<-c.done
 	c.clientLock.Lock()
-	defer c.clientLock.Unlock()
-	if c.client != nil {
-		err := c.client.Disconnect(context.Background())
-		c.client = nil
-		return err
+	c.closed = true
+	ref := c.client
+	disconnect := ref != nil && c.retireClientLocked(ref)
+	c.clientLock.Unlock()
+	if disconnect {
+		return c.disconnect(ref)
 	}
 	return nil
 }
 
 func (c *Collector) snapshot() {
+	defer func() {
+		if r := recover(); r != nil {
+			c.logger.Error("mongo snapshot panic:", r, "\n", string(debug.Stack()))
+		}
+	}()
+
 	timeout := c.scrapeInterval - time.Second
 	if timeout <= 0 {
 		timeout = time.Second
@@ -244,10 +325,11 @@ func (c *Collector) snapshot() {
 	ctx, cancel := context.WithTimeout(c.ctx, timeout)
 	defer cancel()
 
-	if err := c.connectAndPing(ctx); err != nil {
+	ref, err := c.connectAndPing(ctx)
+	if err != nil {
 		c.logger.Warning(err)
 		c.lock.Lock()
-		c.scrapeErrors = map[string]bool{err.Error(): true}
+		c.scrapeErrors = map[string]bool{errorReason(err): true}
 		c.serverVersion = ""
 		c.rsStatus = nil
 		c.rsConfig = nil
@@ -258,82 +340,108 @@ func (c *Collector) snapshot() {
 		c.lock.Unlock()
 		return
 	}
+	defer c.releaseClient(ref)
+	client := ref.client
 
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	scrapeErrors := map[string]bool{}
+	scrapeError := func(what string, err error) {
+		c.logger.Warning(what+":", err)
+		scrapeErrors[what+": "+errorReason(err)] = true
+	}
 
-	c.scrapeErrors = map[string]bool{}
+	bi, err := c.collectBuildInfo(ctx, client)
+	if err != nil {
+		scrapeError("buildInfo", err)
+	}
 
-	if bi, err := c.collectBuildInfo(ctx); err != nil {
-		c.logger.Warning(err)
-		c.scrapeErrors[err.Error()] = true
+	ss, err := c.collectServerStatus(ctx, client)
+	if err != nil {
+		scrapeError("serverStatus", err)
+	}
+
+	currentOp, err := c.collectCurrentOp(ctx, client)
+	if err != nil {
+		scrapeError("$currentOp", err)
+	}
+
+	profilingLevels, topQueries, profilerErr := c.collectProfiler(ctx, client)
+	if profilerErr != nil {
+		scrapeError("profiler", profilerErr)
+	}
+
+	rsStatus := c.rsStatus // only the snapshot goroutine writes it, so reading without the lock is safe
+	if rs, err := c.collectReplStatus(ctx, client); err != nil {
+		scrapeError("replSetGetStatus", err)
 	} else {
-		c.serverVersion = bi.Version
-		c.isPercona = bi.PsmdbVersion != ""
+		rsStatus = rs
 	}
 
-	if err := c.collectServerStatus(ctx); err != nil {
-		c.logger.Warning(err)
-		c.scrapeErrors[err.Error()] = true
-		c.ss = nil
-	}
-
-	if err := c.collectCurrentOp(ctx); err != nil {
-		c.logger.Warning(err)
-		c.scrapeErrors[err.Error()] = true
-		c.currentOp = nil
-	}
-
-	if err := c.collectProfiler(ctx); err != nil {
-		c.logger.Warning(err)
-		c.scrapeErrors[err.Error()] = true
-		c.topQueries = nil
-	}
-
-	if rs, err := c.collectReplStatus(ctx); err != nil {
-		c.logger.Warning(err)
-		c.scrapeErrors[err.Error()] = true
+	rsConfig := c.rsConfig
+	if cfg, err := c.collectReplConfig(ctx, client); err != nil {
+		scrapeError("replSetGetConfig", err)
 	} else {
-		c.rsStatus = rs
+		rsConfig = cfg
 	}
 
-	if cfg, err := c.collectReplConfig(ctx); err != nil {
-		c.logger.Warning(err)
-		c.scrapeErrors[err.Error()] = true
-	} else {
-		c.rsConfig = cfg
-	}
-
-	if c.rsStatus != nil && c.rsStatus.ReplicaSet != "" {
-		if oplog, err := c.collectOplog(ctx); err != nil {
-			c.logger.Warning(err)
-			c.scrapeErrors[err.Error()] = true
+	var oplog *OplogStats
+	if rsStatus != nil && rsStatus.ReplicaSet != "" {
+		oplog = c.oplog
+		if o, err := c.collectOplog(ctx, client); err != nil {
+			scrapeError("oplog", err)
 		} else {
-			c.oplog = oplog
+			oplog = o
 		}
-	} else {
-		c.oplog = nil
 	}
 
 	if c.emitter != nil {
-		c.trackSettingsChanges(ctx)
+		c.trackSettingsChanges(ctx, client)
 	}
+	dbSizes, tableGrowth := c.dbSizes, c.tableGrowth
 	if c.dbTracker != nil {
-		c.dbTracker.client = c.client
+		c.dbTracker.client = client
 		c.dbTracker.Track(ctx, c.emitter, c.targetAddr)
+		// Track replaces (never mutates) these after it returns, so they can be published as is.
+		dbSizes, tableGrowth = c.dbTracker.DBSizes, c.dbTracker.TableGrowth
+		c.dbTracker.client = nil
 	}
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.scrapeErrors = scrapeErrors
+	if bi != nil {
+		c.serverVersion = bi.Version
+		c.isPercona = bi.PsmdbVersion != ""
+	}
+	c.ss = ss
+	c.ssCounters = c.ssTotals.clone()
+	c.journalBytesAtCheckpoint = c.ckptJournalBytes
+	c.lastCheckpointAt = c.ckptAt
+	c.currentOp = currentOp
+	if profilerErr != nil {
+		c.topQueries = nil
+	} else {
+		c.profilingLevels = profilingLevels
+		c.topQueries = topQueries
+	}
+	c.rsStatus = rsStatus
+	c.rsConfig = rsConfig
+	c.oplog = oplog
+	c.dbSizes = dbSizes
+	c.tableGrowth = tableGrowth
 }
 
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	ctx, cancelFunc := context.WithTimeout(c.ctx, c.collectTimeout)
 	defer cancelFunc()
 
-	if err := c.connectAndPing(ctx); err != nil {
+	ref, err := c.connectAndPing(ctx)
+	if err != nil {
 		c.logger.Warning(err)
 		ch <- common.Gauge(dUp, 0)
-		ch <- common.Gauge(dScrapeError, 1, err.Error(), "")
+		ch <- common.Gauge(dScrapeError, 1, errorReason(err), "")
 		return
 	}
+	c.releaseClient(ref)
 	ch <- common.Gauge(dUp, 1)
 
 	c.lock.RLock()
@@ -367,8 +475,8 @@ type BuildInfo struct {
 	PsmdbVersion string `bson:"psmdbVersion"`
 }
 
-func (c *Collector) collectBuildInfo(ctx context.Context) (*BuildInfo, error) {
-	res := c.client.Database("admin").RunCommand(ctx, bson.D{{Key: "buildInfo", Value: "1"}})
+func (c *Collector) collectBuildInfo(ctx context.Context, client *mongo.Client) (*BuildInfo, error) {
+	res := client.Database("admin").RunCommand(ctx, bson.D{{Key: "buildInfo", Value: "1"}})
 	var bi BuildInfo
 	if err := res.Decode(&bi); err != nil {
 		return nil, err
@@ -389,8 +497,8 @@ type ReplStatus struct {
 	Members    []Member `bson:"members"`
 }
 
-func (c *Collector) collectReplStatus(ctx context.Context) (*ReplStatus, error) {
-	res := c.client.Database("admin").RunCommand(ctx, bson.D{{Key: "replSetGetStatus", Value: "1"}})
+func (c *Collector) collectReplStatus(ctx context.Context, client *mongo.Client) (*ReplStatus, error) {
+	res := client.Database("admin").RunCommand(ctx, bson.D{{Key: "replSetGetStatus", Value: "1"}})
 	var s ReplStatus
 	if err := res.Decode(&s); err != nil {
 		if e, ok := err.(mongo.CommandError); ok {
@@ -410,8 +518,8 @@ var settingsMetadataKeys = map[string]bool{
 	"operationTime": true,
 }
 
-func (c *Collector) trackSettingsChanges(ctx context.Context) {
-	res := c.client.Database("admin").RunCommand(ctx, bson.D{{Key: "getParameter", Value: "*"}})
+func (c *Collector) trackSettingsChanges(ctx context.Context, client *mongo.Client) {
+	res := client.Database("admin").RunCommand(ctx, bson.D{{Key: "getParameter", Value: "*"}})
 	var params bson.M
 	if err := res.Decode(&params); err != nil {
 		c.logger.Warning("getParameter:", err)
@@ -453,7 +561,7 @@ func (c *Collector) sizesMetrics(ch chan<- prometheus.Metric) {
 	if c.dbTracker == nil || !c.dbTracker.trackSizes {
 		return
 	}
-	for dbName, snap := range c.dbTracker.DBSizes {
+	for dbName, snap := range c.dbSizes {
 		ch <- common.Gauge(dDbSize, snap.DatabaseSize, dbName)
 		for _, t := range snap.Tables {
 			ch <- common.Gauge(dCollectionSize, t.Size, dbName, t.Table)
@@ -462,7 +570,7 @@ func (c *Collector) sizesMetrics(ch chan<- prometheus.Metric) {
 			ch <- common.Gauge(dCollectionDocuments, t.Documents, dbName, t.Table)
 		}
 	}
-	for _, g := range c.dbTracker.TableGrowth {
+	for _, g := range c.tableGrowth {
 		ch <- common.Gauge(dCollectionSizeGrowth, g.Growth, g.DB, g.Table)
 	}
 }

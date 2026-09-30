@@ -3,13 +3,15 @@ package metrics
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"os"
 	"sync/atomic"
 	"time"
 
 	"github.com/coroot/coroot-cluster-agent/common"
-	"github.com/coroot/coroot-cluster-agent/flags"
-	"github.com/go-kit/log/level"
+	cfgpkg "github.com/coroot/coroot-cluster-agent/config"
+	remoteapi "github.com/prometheus/client_golang/exp/api/remote"
 	"github.com/prometheus/client_golang/prometheus"
 	promCommon "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
@@ -64,21 +66,31 @@ func (ms *Metrics) closeStorage(ctx context.Context) {
 	})
 }
 
-func (ms *Metrics) runScraper() error {
-	logger := level.NewFilter(Logger{}, level.AllowInfo())
-	cfg := config.DefaultConfig
+// promConfig builds the Prometheus configuration of the scraper: the remote-write endpoint,
+// the agent's own /metrics (along with kube-state-metrics), the pods annotated for custom metrics,
+// and the native /metrics endpoints of the statically configured services (RabbitMQ, etcd).
+func (ms *Metrics) promConfig(logger *slog.Logger) (*config.Config, error) {
+	// The config is built programmatically, but since Prometheus 0.311 GetScrapeConfigs (used by the scrape manager)
+	// refuses to work with a config that wasn't created by config.Load. So an empty config is loaded
+	// (which only applies the defaults), and the scrape and remote-write configs are then validated here,
+	// as Load would do. This avoids a YAML round-trip, which would replace the secrets with "<secret>".
+	cfg, err := config.Load("", logger)
+	if err != nil {
+		return nil, err
+	}
 	cfg.GlobalConfig.ScrapeInterval = model.Duration(ms.scrapeInterval)
 	cfg.GlobalConfig.ScrapeTimeout = model.Duration(ms.scrapeTimeout)
 	cfg.RemoteWriteConfigs = append(cfg.RemoteWriteConfigs,
 		&config.RemoteWriteConfig{
-			URL:           &promCommon.URL{URL: ms.endpoint},
-			Headers:       common.AuthHeaders(ms.apiKey),
-			RemoteTimeout: model.Duration(RemoteWriteTimeout),
-			QueueConfig:   config.DefaultQueueConfig,
+			URL:             &promCommon.URL{URL: ms.endpoint},
+			Headers:         common.AuthHeaders(ms.apiKey),
+			RemoteTimeout:   model.Duration(RemoteWriteTimeout),
+			ProtobufMessage: remoteapi.WriteV1MessageType,
+			QueueConfig:     config.DefaultQueueConfig,
 			HTTPClientConfig: promCommon.HTTPClientConfig{
 				TLSConfig: promCommon.TLSConfig{
-					InsecureSkipVerify: *flags.InsecureSkipVerify,
-					CAFile:             *flags.CAFile,
+					InsecureSkipVerify: ms.insecureSkipVerify,
+					CAFile:             ms.caFile,
 				},
 			},
 		},
@@ -95,25 +107,68 @@ func (ms *Metrics) runScraper() error {
 	}
 
 	cfg.ScrapeConfigs = append(cfg.ScrapeConfigs, &config.ScrapeConfig{
-		JobName:                 jobName,
-		HonorLabels:             true,
-		ScrapeClassicHistograms: true,
-		MetricsPath:             "/metrics",
-		Scheme:                  "http",
-		EnableCompression:       false,
+		JobName:                       jobName,
+		HonorLabels:                   true,
+		AlwaysScrapeClassicHistograms: ptr(true),
+		MetricsPath:                   "/metrics",
+		Scheme:                        "http",
+		EnableCompression:             false,
 		ServiceDiscoveryConfigs: []discovery.Config{
 			discovery.StaticConfig{{Targets: targets}},
 		},
 		MetricRelabelConfigs: []*relabel.Config{
 			{
-				Regex:  relabel.MustNewRegexp("customresource_(group|kind|version)"),
-				Action: relabel.LabelDrop,
+				Regex:       relabel.MustNewRegexp("customresource_(group|kind|version)"),
+				Action:      relabel.LabelDrop,
+				Separator:   relabel.DefaultRelabelConfig.Separator,
+				Replacement: relabel.DefaultRelabelConfig.Replacement,
 			},
 		},
 	})
-	if k8sCfg := k8sDiscovery(); k8sCfg != nil {
+	inK8s := inK8sCluster()
+	if inK8s {
 		klog.Infoln("enabling k8s service discovery")
-		cfg.ScrapeConfigs = append(cfg.ScrapeConfigs, k8sCfg)
+		cfg.ScrapeConfigs = append(cfg.ScrapeConfigs, k8sDiscovery())
+	} else {
+		klog.Infoln("not in k8s cluster, disabling k8s service discovery")
+	}
+	var databases []cfgpkg.Database
+	if ms.static != nil {
+		databases = ms.static.Databases
+	}
+	native, err := nativeScrapeConfigs(databases, inK8s)
+	if err != nil {
+		return nil, err
+	}
+	cfg.ScrapeConfigs = append(cfg.ScrapeConfigs, native...)
+
+	jobNames := map[string]bool{}
+	for _, sc := range cfg.ScrapeConfigs {
+		if jobNames[sc.JobName] {
+			return nil, fmt.Errorf("duplicate scrape job name %q", sc.JobName)
+		}
+		jobNames[sc.JobName] = true
+		if err = sc.Validate(cfg.GlobalConfig); err != nil {
+			return nil, err
+		}
+	}
+	for _, rw := range cfg.RemoteWriteConfigs {
+		if err = rw.Validate(cfg.GlobalConfig.MetricNameValidationScheme); err != nil {
+			return nil, err
+		}
+	}
+	return cfg, nil
+}
+
+func ptr[T any](v T) *T {
+	return &v
+}
+
+func (ms *Metrics) runScraper() error {
+	logger := NewLogger()
+	cfg, err := ms.promConfig(logger)
+	if err != nil {
+		return err
 	}
 
 	discCtx, cancelDiscovery := context.WithCancel(context.Background())
@@ -122,11 +177,11 @@ func (ms *Metrics) runScraper() error {
 
 	localStorage := &readyStorage{stats: tsdb.NewDBStats()}
 	scraper := &readyScrapeManager{}
-	remoteStorage := remote.NewStorage(logger, prometheus.DefaultRegisterer, localStorage.StartTime, ms.walDir, RemoteFlushDeadline, scraper)
+	remoteStorage := remote.NewStorage(logger, prometheus.DefaultRegisterer, localStorage.StartTime, ms.walDir, RemoteFlushDeadline, scraper, false)
 	fanoutStorage := storage.NewFanout(logger, localStorage, remoteStorage)
 	state.storage = fanoutStorage
 
-	if err := remoteStorage.ApplyConfig(&cfg); err != nil {
+	if err := remoteStorage.ApplyConfig(cfg); err != nil {
 		return err
 	}
 	sdMetrics, err := discovery.CreateAndRegisterSDMetrics(prometheus.DefaultRegisterer)
@@ -155,11 +210,11 @@ func (ms *Metrics) runScraper() error {
 		}
 	}()
 
-	scrapeManager, err := scrape.NewManager(nil, logger, fanoutStorage, prometheus.DefaultRegisterer)
+	scrapeManager, err := scrape.NewManager(nil, logger, nil, nil, fanoutStorage, prometheus.DefaultRegisterer)
 	if err != nil {
 		return err
 	}
-	if err = scrapeManager.ApplyConfig(&cfg); err != nil {
+	if err = scrapeManager.ApplyConfig(cfg); err != nil {
 		return err
 	}
 	scraper.Set(scrapeManager)
@@ -178,19 +233,18 @@ func (ms *Metrics) runScraper() error {
 	return nil
 }
 
+func inK8sCluster() bool {
+	return os.Getenv("KUBERNETES_SERVICE_HOST") != "" && os.Getenv("KUBERNETES_SERVICE_PORT") != ""
+}
+
 func k8sDiscovery() *config.ScrapeConfig {
-	host, port := os.Getenv("KUBERNETES_SERVICE_HOST"), os.Getenv("KUBERNETES_SERVICE_PORT")
-	if len(host) == 0 || len(port) == 0 {
-		klog.Infoln("not in k8s cluster, disabling k8s service discovery")
-		return nil
-	}
 	return &config.ScrapeConfig{
-		JobName:                 "custom-metrics-k8s-pods",
-		HonorLabels:             true,
-		ScrapeClassicHistograms: true,
-		MetricsPath:             "/metrics",
-		Scheme:                  "http",
-		EnableCompression:       false,
+		JobName:                       "custom-metrics-k8s-pods",
+		HonorLabels:                   true,
+		AlwaysScrapeClassicHistograms: ptr(true),
+		MetricsPath:                   "/metrics",
+		Scheme:                        "http",
+		EnableCompression:             false,
 		RelabelConfigs: []*relabel.Config{
 			{
 				SourceLabels: model.LabelNames{"__meta_kubernetes_pod_annotation_coroot_com_scrape_metrics"},
@@ -240,10 +294,14 @@ func k8sDiscovery() *config.ScrapeConfig {
 			},
 		},
 		ServiceDiscoveryConfigs: []discovery.Config{
-			&kubernetes.SDConfig{
-				Role:      kubernetes.RolePod,
-				Selectors: []kubernetes.SelectorConfig{{Role: "pod"}},
-			},
+			k8sPodSDConfig(),
 		},
 	}
+}
+
+func k8sPodSDConfig() *kubernetes.SDConfig {
+	sd := kubernetes.DefaultSDConfig
+	sd.Role = kubernetes.RolePod
+	sd.Selectors = []kubernetes.SelectorConfig{{Role: "pod"}}
+	return &sd
 }

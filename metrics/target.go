@@ -407,6 +407,8 @@ func (t *Target) newCollector(credentials Credentials, tlsCreds common.TLSCreden
 			return nil, nil, err
 		}
 		return collector, func() { _ = collector.Close() }, nil
+	case TargetTypePgbouncer:
+		return t.newPgbouncerCollector(credentials, tlsCreds, collectTimeout)
 	}
 	return nil, nil, fmt.Errorf("unsupported target type: %s", t.Type)
 }
@@ -578,6 +580,27 @@ func TargetFromPod(pod *k8s.Pod) *Target {
 				"excludeConsumerGroups": pod.Annotations["coroot.com/kafka-scrape-param-exclude-consumer-groups"],
 				// every annotated broker pod is a target: only the one with the lowest node ID reports the cluster
 				"clusterMetrics": cmp.Or(pod.Annotations["coroot.com/kafka-scrape-param-cluster-metrics"], kafka.ClusterMetricsLowestBroker),
+			},
+		}
+	}
+
+	if pod.Annotations["coroot.com/pgbouncer-scrape"] == "true" {
+		t = &Target{
+			Type: TargetTypePgbouncer,
+			Addr: net.JoinHostPort(pod.IP, cmp.Or(pod.Annotations["coroot.com/pgbouncer-scrape-port"], "6432")),
+			Credentials: Credentials{
+				Username: pod.Annotations["coroot.com/pgbouncer-scrape-credentials-username"],
+				Password: pod.Annotations["coroot.com/pgbouncer-scrape-credentials-password"],
+			},
+			CredentialsSecret: CredentialsSecret{
+				Namespace:   pod.Id.Namespace,
+				Name:        pod.Annotations["coroot.com/pgbouncer-scrape-credentials-secret-name"],
+				UsernameKey: pod.Annotations["coroot.com/pgbouncer-scrape-credentials-secret-username-key"],
+				PasswordKey: pod.Annotations["coroot.com/pgbouncer-scrape-credentials-secret-password-key"],
+			},
+			TLSSecret: tlsSecretFromPod(pod, "pgbouncer"),
+			Params: map[string]string{
+				"sslmode": pod.Annotations["coroot.com/pgbouncer-scrape-param-sslmode"],
 			},
 		}
 	}

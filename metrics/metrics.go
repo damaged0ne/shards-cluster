@@ -44,6 +44,9 @@ type Metrics struct {
 	scrapeTimeout  time.Duration
 	walDir         string
 
+	insecureSkipVerify bool   // for the remote-write endpoint
+	caFile             string // for the remote-write endpoint
+
 	reg *prometheus.Registry
 
 	targets     map[string]*Target
@@ -82,11 +85,14 @@ func NewMetrics(k8s *k8s.K8S, static *config.Static) (*Metrics, error) {
 		scrapeInterval: *flags.MetricsScrapeInterval,
 		scrapeTimeout:  *flags.MetricsScrapeTimeout,
 		walDir:         *flags.MetricsWALDir,
-		reg:            prometheus.NewRegistry(),
-		targets:        map[string]*Target{},
-		k8s:            k8s,
-		static:         static,
-		stopCh:         make(chan struct{}),
+
+		insecureSkipVerify: *flags.InsecureSkipVerify,
+		caFile:             *flags.CAFile,
+		reg:                prometheus.NewRegistry(),
+		targets:            map[string]*Target{},
+		k8s:                k8s,
+		static:             static,
+		stopCh:             make(chan struct{}),
 	}
 	ms.startTarget = ms.startTargetExporter
 
@@ -532,6 +538,9 @@ func (ms *Metrics) delPodTarget(target *Target) {
 func (ms *Metrics) resolveDatabases(databases []config.Database) []*Target {
 	var res []*Target
 	for _, d := range databases {
+		if IsNativeScrapeType(d.Type) { // scraped by the scrape manager, see nativeScrapeConfigs
+			continue
+		}
 		var endpoints []common.Endpoint
 		var description string
 		switch {

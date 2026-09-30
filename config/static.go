@@ -15,6 +15,9 @@ type Static struct {
 	Databases []Database   `yaml:"databases"`
 }
 
+// nativeScrapeTypes are the types scraped via their native /metrics endpoints (the port defaults to the standard one).
+var nativeScrapeTypes = map[string]bool{"rabbitmq": true, "etcd": true}
+
 func LoadStatic(path string) (*Static, error) {
 	if path == "" {
 		return nil, nil
@@ -53,7 +56,10 @@ func (s *Static) Validate() error {
 		if d.AzureDB != "" && d.Type != "postgres" && d.Type != "mysql" {
 			return fmt.Errorf("databases[%d]: azuredb requires type postgres or mysql", i)
 		}
-		if d.Host != "" && d.Port == "" {
+		if nativeScrapeTypes[d.Type] && d.Host == "" {
+			return fmt.Errorf("databases[%d]: host is required for %s", i, d.Type)
+		}
+		if d.Host != "" && d.Port == "" && !nativeScrapeTypes[d.Type] {
 			return fmt.Errorf("databases[%d]: port is required with host", i)
 		}
 	}

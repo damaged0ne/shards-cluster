@@ -56,9 +56,12 @@ type Discoverer struct {
 	k8s          *k8s.K8S
 	compartments []string
 	region       string
-	ctx          context.Context
+	ctx          context.Context // cancelled on Stop
+	cancel       context.CancelFunc
 	reg          prometheus.Registerer
 	stop         chan struct{}
+	stopOnce     sync.Once
+	done         chan struct{} // closed when the discovery goroutine exits
 
 	mysqlClient         mysql.DbSystemClient
 	mysqlReplicasClient mysql.ReplicasClient
@@ -115,37 +118,45 @@ func (d *Discoverer) CacheEndpoint(name string) (common.Endpoint, bool) {
 }
 
 func NewDiscoverer(cfg *config.OCIConfig, k8s *k8s.K8S, reg prometheus.Registerer, logCounters func(name string) []logparser.LogCounter) (*Discoverer, error) {
+	ctx, cancel := context.WithCancel(context.Background())
 	d := &Discoverer{
 		cfg:             cfg,
 		k8s:             k8s,
-		ctx:             context.Background(),
+		ctx:             ctx,
+		cancel:          cancel,
 		reg:             reg,
 		stop:            make(chan struct{}),
+		done:            make(chan struct{}),
 		errors:          map[string]bool{},
 		dbCollectors:    map[string]*DBCollector{},
 		cacheCollectors: map[string]*CacheCollector{},
 		logCounters:     logCounters,
 	}
 	if err := d.init(); err != nil {
+		cancel()
 		return nil, err
 	}
 	if err := reg.Register(d); err != nil {
+		cancel()
 		return nil, err
 	}
-	go func() {
-		d.discover()
-		t := time.NewTicker(discoveryInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-d.stop:
-				return
-			case <-t.C:
-				d.discover()
-			}
-		}
-	}()
+	go d.run(d.discover)
 	return d, nil
+}
+
+func (d *Discoverer) run(discover func()) {
+	defer close(d.done)
+	discover()
+	t := time.NewTicker(discoveryInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-d.stop:
+			return
+		case <-t.C:
+			discover()
+		}
+	}
 }
 
 func (d *Discoverer) Config() *config.OCIConfig {
@@ -242,17 +253,22 @@ func retry() ocicommon.RequestMetadata {
 	return ocicommon.RequestMetadata{RetryPolicy: &policy}
 }
 
+// Stop is idempotent. It cancels the in-flight API calls, so waiting for the discovery goroutine is short.
 func (d *Discoverer) Stop() {
-	d.stop <- struct{}{}
-	for id, c := range d.dbCollectors {
-		prometheus.WrapRegistererWith(dbLabels(id), d.reg).Unregister(c)
-		c.Stop()
-	}
-	for id, c := range d.cacheCollectors {
-		prometheus.WrapRegistererWith(cacheLabels(id), d.reg).Unregister(c)
-		c.Stop()
-	}
-	d.reg.Unregister(d)
+	d.stopOnce.Do(func() {
+		d.cancel()
+		close(d.stop)
+		<-d.done
+		for id, c := range d.dbCollectors {
+			prometheus.WrapRegistererWith(dbLabels(id), d.reg).Unregister(c)
+			c.Stop()
+		}
+		for id, c := range d.cacheCollectors {
+			prometheus.WrapRegistererWith(cacheLabels(id), d.reg).Unregister(c)
+			c.Stop()
+		}
+		d.reg.Unregister(d)
+	})
 }
 
 func (d *Discoverer) Describe(ch chan<- *prometheus.Desc) {
@@ -285,6 +301,9 @@ func (d *Discoverer) registerError(err error) {
 func (d *Discoverer) discover() {
 	d.discoverDBSystems()
 	d.discoverCaches()
+	if d.ctx.Err() != nil { // stopped
+		return
+	}
 	d.publishEndpoints()
 	if len(d.dbCollectors) > 0 || len(d.cacheCollectors) > 0 {
 		d.monitoring.refresh(d)
@@ -310,20 +329,21 @@ func (d *Discoverer) publishEndpoints() {
 	replicas := map[string][]string{}
 	logServices := map[string]string{}
 	for _, c := range d.dbCollectors {
-		if c.info.host != "" {
-			dbs[c.info.name] = common.Endpoint{Host: c.info.host, Port: c.info.port}
+		info, logs := c.snapshot()
+		if info.host != "" {
+			dbs[info.name] = common.Endpoint{Host: info.host, Port: info.port}
 		}
-		if c.info.primary != "" {
-			replicas[c.info.primary] = append(replicas[c.info.primary], c.info.name)
+		if info.primary != "" {
+			replicas[info.primary] = append(replicas[info.primary], info.name)
 		}
-		if c.logs == nil && *flags.CollectOCILogs {
-			logServices[c.info.name] = dbLogService(c.info.id)
+		if logs == nil && *flags.CollectOCILogs {
+			logServices[info.name] = dbLogService(info.id)
 		}
 	}
 	caches := map[string]common.Endpoint{}
 	for _, c := range d.cacheCollectors {
-		if c.info.host != "" {
-			caches[c.info.name] = common.Endpoint{Host: c.info.host, Port: c.info.port}
+		if info := c.getInfo(); info.host != "" {
+			caches[info.name] = common.Endpoint{Host: info.host, Port: info.port}
 		}
 	}
 	d.endpointsLock.Lock()

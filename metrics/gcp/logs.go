@@ -3,6 +3,7 @@ package gcp
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/coroot/coroot-cluster-agent/common"
@@ -22,6 +23,7 @@ type LogReader struct {
 	emitter    *common.LogEmitter
 	ch         chan logparser.LogEntry
 	stop       chan struct{}
+	stopOnce   sync.Once
 }
 
 func NewLogReader(discoverer *Discoverer, instance string, forward bool) *LogReader {
@@ -59,12 +61,15 @@ func NewLogReader(discoverer *Discoverer, instance string, forward bool) *LogRea
 	return r
 }
 
+// Stop is idempotent and doesn't wait for an in-flight refresh (it stops sending to the parser).
 func (r *LogReader) Stop() {
-	close(r.stop)
-	r.parser.Stop()
-	if r.emitter != nil {
-		r.emitter.Stop()
-	}
+	r.stopOnce.Do(func() {
+		close(r.stop)
+		r.parser.Stop()
+		if r.emitter != nil {
+			r.emitter.Stop()
+		}
+	})
 }
 
 func (r *LogReader) Counters() []logparser.LogCounter {

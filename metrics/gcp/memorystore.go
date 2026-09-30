@@ -3,6 +3,7 @@ package gcp
 import (
 	"strconv"
 	"strings"
+	"sync"
 
 	"cloud.google.com/go/memorystore/apiv1/memorystorepb"
 	"github.com/coroot/coroot-cluster-agent/common"
@@ -27,7 +28,20 @@ type memorystoreInfo struct {
 
 type MemorystoreCollector struct {
 	discoverer *Discoverer
+	lock       sync.RWMutex // info is replaced by the discovery goroutine and read by Collect
 	info       memorystoreInfo
+}
+
+func (c *MemorystoreCollector) getInfo() memorystoreInfo {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return c.info
+}
+
+func (c *MemorystoreCollector) setInfo(info memorystoreInfo) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.info = info
 }
 
 func (c *MemorystoreCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -35,7 +49,7 @@ func (c *MemorystoreCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *MemorystoreCollector) Collect(ch chan<- prometheus.Metric) {
-	i := c.info
+	i := c.getInfo()
 	ch <- common.Gauge(dMemorystoreStatus, 1, i.state)
 	ch <- common.Gauge(dMemorystoreInfo, 1,
 		i.project, i.region, i.zone, i.host, i.port, i.engine, i.version, i.tier, i.memorySizeGb, i.instance,
@@ -57,7 +71,9 @@ func (d *Discoverer) discoverMemorystore() {
 	for _, list := range []func() ([]memorystoreInfo, error){d.listRedis, d.listMemcached, d.listValkey} {
 		res, err := list()
 		if err != nil {
-			d.registerError(err)
+			if d.ctx.Err() == nil {
+				d.registerError(err)
+			}
 			failed = true
 		}
 		found = append(found, res...)
@@ -80,9 +96,9 @@ func (d *Discoverer) discoverMemorystore() {
 			}
 			d.redisCollectors[info.id] = c
 		}
-		c.info = info
+		c.setInfo(info)
 	}
-	if failed { // a product couldn't be listed: keep its collectors rather than dropping and re-adding them
+	if failed || d.ctx.Err() != nil { // a product couldn't be listed: keep its collectors rather than dropping and re-adding them
 		return
 	}
 	for id, c := range d.redisCollectors {

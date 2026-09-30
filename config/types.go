@@ -36,6 +36,9 @@ type Database struct {
 	Memorystore string            `yaml:"memorystore"`
 	OCIDB       string            `yaml:"ocidb"`
 	OCICache    string            `yaml:"ocicache"`
+	MemoryDB    string            `yaml:"memorydb"`
+	AzureDB     string            `yaml:"azuredb"`
+	AzureRedis  string            `yaml:"azureredis"`
 	Credentials Credentials       `yaml:"credentials"`
 	Params      map[string]string `yaml:"params"`
 }
@@ -46,7 +49,12 @@ type AWSConfig struct {
 	SecretAccessKey string `json:"secret_access_key" yaml:"secretAccessKey"`
 
 	RDSTagFilters         map[string]string `json:"rds_tag_filters" yaml:"rdsTagFilters"`
-	ElasticacheTagFilters map[string]string `json:"elasticache_tag_filters" yaml:"elasticacheTagFilters"`
+	ElasticacheTagFilters map[string]string `json:"elasticache_tag_filters" yaml:"elasticacheTagFilters"` // also applied to ElastiCache Serverless caches
+	MemoryDBTagFilters    map[string]string `json:"memorydb_tag_filters" yaml:"memorydbTagFilters"`
+
+	// CloudWatchPeriodSeconds is the period of the CloudWatch metrics (Aurora replica lag and Serverless v2 capacity,
+	// ElastiCache Serverless usage) and the interval of their refresh: 60 by default, rounded up to a multiple of 60.
+	CloudWatchPeriodSeconds int `json:"cloudwatch_period_seconds" yaml:"cloudwatchPeriodSeconds"`
 }
 
 func (c *AWSConfig) Equal(other *AWSConfig) bool {
@@ -54,7 +62,9 @@ func (c *AWSConfig) Equal(other *AWSConfig) bool {
 		c.AccessKeyID == other.AccessKeyID &&
 		c.SecretAccessKey == other.SecretAccessKey &&
 		maps.Equal(c.RDSTagFilters, other.RDSTagFilters) &&
-		maps.Equal(c.ElasticacheTagFilters, other.ElasticacheTagFilters)
+		maps.Equal(c.ElasticacheTagFilters, other.ElasticacheTagFilters) &&
+		maps.Equal(c.MemoryDBTagFilters, other.MemoryDBTagFilters) &&
+		c.CloudWatchPeriodSeconds == other.CloudWatchPeriodSeconds
 }
 
 type GCPConfig struct {
@@ -93,4 +103,27 @@ func (c *OCIConfig) Equal(other *OCIConfig) bool {
 		c.PrivateKey == other.PrivateKey &&
 		maps.Equal(c.DBTagFilters, other.DBTagFilters) &&
 		maps.Equal(c.CacheTagFilters, other.CacheTagFilters)
+}
+
+// AzureConfig configures the discovery of Azure Database for PostgreSQL / MySQL flexible servers and Azure Cache for Redis.
+// Authentication uses DefaultAzureCredential (environment service principal, workload identity or managed identity):
+// no secrets are part of this config.
+type AzureConfig struct {
+	SubscriptionIDs    []string          `json:"subscription_ids" yaml:"subscriptionIds"` // AZURE_SUBSCRIPTION_ID by default
+	TenantID           string            `json:"tenant_id" yaml:"tenantId"`
+	ResourceGroups     []string          `json:"resource_groups" yaml:"resourceGroups"` // all the resource groups of the subscriptions if empty
+	Locations          []string          `json:"locations" yaml:"locations"`            // all the locations if empty
+	PostgresTagFilters map[string]string `json:"postgres_tag_filters" yaml:"postgresTagFilters"`
+	MySQLTagFilters    map[string]string `json:"mysql_tag_filters" yaml:"mysqlTagFilters"`
+	RedisTagFilters    map[string]string `json:"redis_tag_filters" yaml:"redisTagFilters"`
+}
+
+func (c *AzureConfig) Equal(other *AzureConfig) bool {
+	return slices.Equal(c.SubscriptionIDs, other.SubscriptionIDs) &&
+		c.TenantID == other.TenantID &&
+		slices.Equal(c.ResourceGroups, other.ResourceGroups) &&
+		slices.Equal(c.Locations, other.Locations) &&
+		maps.Equal(c.PostgresTagFilters, other.PostgresTagFilters) &&
+		maps.Equal(c.MySQLTagFilters, other.MySQLTagFilters) &&
+		maps.Equal(c.RedisTagFilters, other.RedisTagFilters)
 }

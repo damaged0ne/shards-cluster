@@ -159,6 +159,10 @@ func (c *RDSCollector) Collect(ch chan<- prometheus.Metric) {
 		collectOsMetrics(osMetrics, ch)
 	}
 
+	if c.discoverer != nil {
+		c.discoverer.collectAurora(region+"/"+aws.ToString(instance.DBInstanceIdentifier), instance, ch)
+	}
+
 	if c.logParser != nil {
 		for _, lc := range c.logParser.GetCounters() {
 			ch <- common.Counter(dRDSLogMessages, float64(lc.Messages), lc.Level.String(), lc.Hash, lc.Sample)

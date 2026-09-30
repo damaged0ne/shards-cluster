@@ -26,6 +26,11 @@ func newTestDiscoverer(reg prometheus.Registerer) *Discoverer {
 		rdsCollectors: map[string]*RDSCollector{},
 		ecCollectors:  map[string]*ECCollector{},
 		ecTags:        newTagCache(ecTagsTTL),
+
+		ecServerlessCollectors: map[string]*ECServerlessCollector{},
+		memoryDBCollectors:     map[string]*MemoryDBCollector{},
+		cloudwatch:             newCloudWatchCache(),
+		cwKick:                 make(chan struct{}, 1),
 	}
 }
 

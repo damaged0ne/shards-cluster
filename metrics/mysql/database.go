@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/coroot/coroot-cluster-agent/metrics/dbtracker"
 	"github.com/coroot/coroot-cluster-agent/schema"
@@ -19,6 +20,39 @@ type databaseTracker struct {
 	trackSizes       bool
 	excludeDatabases map[string]bool
 	logger           logger.Logger
+
+	mu            sync.RWMutex // guards unusedIndexes and errReasons
+	unusedIndexes *unusedIndexes
+	errReasons    map[string]bool // bounded error reasons of the optional queries of the last run
+}
+
+// indexResults returns the latest unused index stats (nil if unavailable). Must not be modified.
+func (dt *databaseTracker) indexResults() *unusedIndexes {
+	dt.mu.RLock()
+	defer dt.mu.RUnlock()
+	return dt.unusedIndexes
+}
+
+// errorReasons returns the error reasons of the last tracking run. Must not be modified.
+func (dt *databaseTracker) errorReasons() map[string]bool {
+	dt.mu.RLock()
+	defer dt.mu.RUnlock()
+	return dt.errReasons
+}
+
+// collectIndexStats runs at the tracking interval: the unused index list is a slowly changing,
+// relatively expensive to join, per-index view.
+func (dt *databaseTracker) collectIndexStats(ctx context.Context) {
+	unused, errs := collectUnusedIndexes(ctx, dt.db, dt.excludeDatabases)
+	reasons := map[string]bool{}
+	for _, err := range errs {
+		dt.logger.Warning(err)
+		reasons[errorReason(err)] = true
+	}
+	dt.mu.Lock()
+	dt.unusedIndexes = unused
+	dt.errReasons = reasons
+	dt.mu.Unlock()
 }
 
 func newDatabaseTracker(db *sql.DB, maxTablesPerDB int, trackSchema, trackSizes bool, excludeDatabases []string, logger logger.Logger) *databaseTracker {
@@ -99,6 +133,7 @@ func (dt *databaseTracker) collectSnapshot(ctx context.Context) (schema.Snapshot
 	}
 
 	if dt.trackSizes {
+		dt.collectIndexStats(ctx)
 		for _, dbName := range validDBs {
 			info := byDB[dbName]
 			dbSizes[dbName].Tables = info.tables

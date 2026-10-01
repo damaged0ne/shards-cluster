@@ -111,6 +111,16 @@ var (
 
 	dTableLocksWaited    = common.Desc("mysql_table_locks_waited_total", "Table-lock requests that had to wait (LOCK TABLES, MyISAM, DDL metadata locks)")
 	dTableLocksImmediate = common.Desc("mysql_table_locks_immediate_total", "Table-lock requests granted immediately")
+
+	dWaitEventSeconds = common.Desc("mysql_wait_event_seconds_total", "Total time spent waiting on the event (performance_schema, top events by total wait time, excluding idle)", "event")
+	dWaitEventCount   = common.Desc("mysql_wait_event_count_total", "Number of waits on the event (performance_schema, top events by total wait time, excluding idle)", "event")
+
+	dReplicationApplierLastLag    = common.Desc("mysql_replication_applier_last_transaction_lag_seconds", "Time between the original commit of the last applied transaction on the source and the end of its applying on this replica, worst of the channel's workers (MySQL 8.0+)", "channel")
+	dReplicationApplierCurrentLag = common.Desc("mysql_replication_applier_current_lag_seconds", "Time since the original commit of the transaction being applied now, worst of the channel's workers; 0 if the applier is idle (MySQL 8.0+)", "channel")
+
+	dIndexUnused         = common.Desc("mysql_index_unused", "Non-unique secondary index not used since the server start (performance_schema); top indexes by size", "schema", "table", "index")
+	dIndexUnusedBytes    = common.Desc("mysql_index_unused_bytes", "Size of the unused index (requires SELECT on mysql.innodb_index_stats)", "schema", "table", "index")
+	dSchemaUnusedIndexes = common.Desc("mysql_schema_unused_indexes", "Number of non-unique secondary indexes not used since the server start", "schema")
 )
 
 var galeraDescs = []*prometheus.Desc{
@@ -175,6 +185,14 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- dDbSize
 	ch <- dTableSize
 	ch <- dTableSizeGrowth
+	ch <- dWaitEventSeconds
+	ch <- dWaitEventCount
+	ch <- dReplicationApplierLastLag
+	ch <- dReplicationApplierCurrentLag
+	ch <- dIndexUnused
+	ch <- dIndexUnusedBytes
+	ch <- dSchemaUnusedIndexes
+
 	for _, d := range galeraDescs {
 		ch <- d
 	}

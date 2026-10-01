@@ -1,0 +1,5 @@
+[
+  {"index":".opendistro_security","health":"green","status":"open","pri":"1","rep":"1","docs.count":"10","docs.deleted":"0","store.size":"300000","pri.store.size":"150000"},
+  {"index":"products","health":"green","status":"open","pri":"2","rep":"1","docs.count":"1900","docs.deleted":"1","store.size":"5600000","pri.store.size":"2800000"},
+  {"index":"top_queries-2024.09.30-00001","health":"green","status":"open","pri":"1","rep":"1","docs.count":"95","docs.deleted":"0","store.size":"200000","pri.store.size":"100000"}
+]

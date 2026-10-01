@@ -15,6 +15,9 @@ import (
 	"github.com/coroot/coroot-cluster-agent/common"
 	"github.com/coroot/coroot-cluster-agent/config"
 	"github.com/coroot/coroot-cluster-agent/k8s"
+	"github.com/coroot/coroot-cluster-agent/metrics/clickhouse"
+	"github.com/coroot/coroot-cluster-agent/metrics/elasticsearch"
+	"github.com/coroot/coroot-cluster-agent/metrics/kafka"
 	"github.com/coroot/coroot-cluster-agent/metrics/mongo"
 	"github.com/coroot/coroot-cluster-agent/metrics/mysql"
 	"github.com/coroot/coroot-cluster-agent/metrics/postgres"
@@ -37,6 +40,11 @@ const (
 	TargetTypeRedis     TargetType = "redis"
 	TargetTypeMongodb   TargetType = "mongodb"
 	TargetTypeMemcached TargetType = "memcached"
+	TargetTypeKafka     TargetType = "kafka"
+
+	TargetTypeClickhouse    TargetType = "clickhouse"
+	TargetTypeElasticsearch TargetType = "elasticsearch"
+	TargetTypeOpensearch    TargetType = "opensearch" // an alias of elasticsearch: the same collector and metrics
 )
 
 type Credentials struct {
@@ -376,6 +384,31 @@ func (t *Target) newCollector(credentials Credentials, tlsCreds common.TLSCreden
 			nil,
 		)
 		return collector, func() {}, nil
+
+	case TargetTypeKafka:
+		collector, err := kafka.New(t.Addr, credentials.Username, credentials.Password, tlsCreds, t.Params, scrapeInterval, collectTimeout, t.logger)
+		if err != nil {
+			return nil, nil, err
+		}
+		return collector, func() { _ = collector.Close() }, nil
+
+	case TargetTypeClickhouse:
+		collector, err := clickhouse.New(t.Addr, credentials.Username, credentials.Password, tlsCreds, t.Params,
+			scrapeInterval, collectTimeout, t.logger, excludeDatabases)
+		if err != nil {
+			return nil, nil, err
+		}
+		return collector, func() { _ = collector.Close() }, nil
+
+	case TargetTypeElasticsearch, TargetTypeOpensearch:
+		collector, err := elasticsearch.New(t.Addr, credentials.Username, credentials.Password, tlsCreds, t.Params,
+			scrapeInterval, collectTimeout, t.logger)
+		if err != nil {
+			return nil, nil, err
+		}
+		return collector, func() { _ = collector.Close() }, nil
+	case TargetTypePgbouncer:
+		return t.newPgbouncerCollector(credentials, tlsCreds, collectTimeout)
 	}
 	return nil, nil, fmt.Errorf("unsupported target type: %s", t.Type)
 }
@@ -523,6 +556,63 @@ func TargetFromPod(pod *k8s.Pod) *Target {
 		}
 	}
 
+	if pod.Annotations["coroot.com/kafka-scrape"] == "true" {
+		t = &Target{
+			Type: TargetTypeKafka,
+			Addr: net.JoinHostPort(pod.IP, cmp.Or(pod.Annotations["coroot.com/kafka-scrape-port"], "9092")),
+			Credentials: Credentials{
+				Username: pod.Annotations["coroot.com/kafka-scrape-credentials-username"],
+				Password: pod.Annotations["coroot.com/kafka-scrape-credentials-password"],
+			},
+			CredentialsSecret: CredentialsSecret{
+				Namespace:   pod.Id.Namespace,
+				Name:        pod.Annotations["coroot.com/kafka-scrape-credentials-secret-name"],
+				UsernameKey: pod.Annotations["coroot.com/kafka-scrape-credentials-secret-username-key"],
+				PasswordKey: pod.Annotations["coroot.com/kafka-scrape-credentials-secret-password-key"],
+			},
+			TLSSecret: tlsSecretFromPod(pod, "kafka"),
+			Params: map[string]string{
+				"sasl":                  pod.Annotations["coroot.com/kafka-scrape-param-sasl"],
+				"tls":                   pod.Annotations["coroot.com/kafka-scrape-param-tls"],
+				"topics":                pod.Annotations["coroot.com/kafka-scrape-param-topics"],
+				"excludeTopics":         pod.Annotations["coroot.com/kafka-scrape-param-exclude-topics"],
+				"consumerGroups":        pod.Annotations["coroot.com/kafka-scrape-param-consumer-groups"],
+				"excludeConsumerGroups": pod.Annotations["coroot.com/kafka-scrape-param-exclude-consumer-groups"],
+				// every annotated broker pod is a target: only the one with the lowest node ID reports the cluster
+				"clusterMetrics": cmp.Or(pod.Annotations["coroot.com/kafka-scrape-param-cluster-metrics"], kafka.ClusterMetricsLowestBroker),
+			},
+		}
+	}
+
+	if pod.Annotations["coroot.com/pgbouncer-scrape"] == "true" {
+		t = &Target{
+			Type: TargetTypePgbouncer,
+			Addr: net.JoinHostPort(pod.IP, cmp.Or(pod.Annotations["coroot.com/pgbouncer-scrape-port"], "6432")),
+			Credentials: Credentials{
+				Username: pod.Annotations["coroot.com/pgbouncer-scrape-credentials-username"],
+				Password: pod.Annotations["coroot.com/pgbouncer-scrape-credentials-password"],
+			},
+			CredentialsSecret: CredentialsSecret{
+				Namespace:   pod.Id.Namespace,
+				Name:        pod.Annotations["coroot.com/pgbouncer-scrape-credentials-secret-name"],
+				UsernameKey: pod.Annotations["coroot.com/pgbouncer-scrape-credentials-secret-username-key"],
+				PasswordKey: pod.Annotations["coroot.com/pgbouncer-scrape-credentials-secret-password-key"],
+			},
+			TLSSecret: tlsSecretFromPod(pod, "pgbouncer"),
+			Params: map[string]string{
+				"sslmode": pod.Annotations["coroot.com/pgbouncer-scrape-param-sslmode"],
+			},
+		}
+	}
+
+	if pod.Annotations["coroot.com/clickhouse-scrape"] == "true" {
+		t = targetFromPodAnnotations(pod, TargetTypeClickhouse, "9000", "protocol", "tls")
+	}
+
+	if pod.Annotations["coroot.com/elasticsearch-scrape"] == "true" {
+		t = targetFromPodAnnotations(pod, TargetTypeElasticsearch, "9200", "tls", "nodes")
+	}
+
 	if t != nil {
 		t.DiscoveredFromPodAnnotations = true
 		t.podKey = pod.Key()
@@ -530,6 +620,34 @@ func TargetFromPod(pod *k8s.Pod) *Target {
 		t.logger = logger.NewKlog(t.String())
 	}
 
+	return t
+}
+
+// targetFromPodAnnotations builds a target from the generic coroot.com/<type>-scrape-* annotations:
+// port, credentials (plain or from a secret), TLS secret and the given params (coroot.com/<type>-scrape-param-<name>).
+func targetFromPodAnnotations(pod *k8s.Pod, targetType TargetType, defaultPort string, params ...string) *Target {
+	prefix := "coroot.com/" + string(targetType) + "-scrape-"
+	t := &Target{
+		Type: targetType,
+		Addr: net.JoinHostPort(pod.IP, cmp.Or(pod.Annotations[prefix+"port"], defaultPort)),
+		Credentials: Credentials{
+			Username: pod.Annotations[prefix+"credentials-username"],
+			Password: pod.Annotations[prefix+"credentials-password"],
+		},
+		CredentialsSecret: CredentialsSecret{
+			Namespace:   pod.Id.Namespace,
+			Name:        pod.Annotations[prefix+"credentials-secret-name"],
+			UsernameKey: pod.Annotations[prefix+"credentials-secret-username-key"],
+			PasswordKey: pod.Annotations[prefix+"credentials-secret-password-key"],
+		},
+		TLSSecret: tlsSecretFromPod(pod, string(targetType)),
+		Params:    map[string]string{},
+	}
+	for _, p := range params {
+		if v := pod.Annotations[prefix+"param-"+p]; v != "" {
+			t.Params[p] = v
+		}
+	}
 	return t
 }
 

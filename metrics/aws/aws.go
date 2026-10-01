@@ -17,8 +17,10 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/elasticache"
+	"github.com/aws/aws-sdk-go-v2/service/memorydb"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	rdstypes "github.com/aws/aws-sdk-go-v2/service/rds/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -60,21 +62,40 @@ type Discoverer struct {
 	rdsClient            *rds.Client
 	elasticacheClient    *elasticache.Client
 	cloudwatchLogsClient *cloudwatchlogs.Client
+	cloudwatchClient     *cloudwatch.Client
+	memorydbClient       *memorydb.Client
 	identityPending      bool
 
 	errors      map[string]bool
 	errorsLock  sync.RWMutex
 	lastSummary string
+	deniedAPIs  map[string]bool // the optional APIs not allowed by the IAM policy, reported once
 
 	// accessed only by the discovery goroutine (and by Stop after it has exited)
 	rdsCollectors map[string]*RDSCollector
 	ecCollectors  map[string]*ECCollector
-	ecTags        *tagCache
+	ecTags        *tagCache // ElastiCache and MemoryDB tags by ARN
 
-	endpointsLock sync.RWMutex
-	rdsEndpoints  map[string]common.Endpoint
-	rdsReplicas   map[string][]string
-	ecEndpoints   map[string][]common.Endpoint
+	ecServerlessCollectors map[string]*ECServerlessCollector
+	memoryDBCollectors     map[string]*MemoryDBCollector
+
+	auroraLock sync.RWMutex
+	aurora     map[string]auroraInstance // by RDS instance id, written by the discovery goroutine, read by Collect
+
+	// the CloudWatch metrics are fetched by their own goroutine, once per period, and served from the cache
+	cloudwatch *cloudWatchCache
+	cwLock     sync.RWMutex
+	cwQueries  []cwQuery
+	cwKick     chan struct{}
+	cwDone     chan struct{} // closed when the CloudWatch goroutine exits (nil if not started)
+
+	endpointsLock     sync.RWMutex
+	rdsEndpoints      map[string]common.Endpoint
+	rdsReplicas       map[string][]string
+	ecEndpoints       map[string][]common.Endpoint
+	ecTLS             map[string]bool // the caches requiring TLS (Serverless)
+	memoryDBEndpoints map[string][]common.Endpoint
+	memoryDBTLS       map[string]bool
 }
 
 func (d *Discoverer) RDSEndpoint(id string) (common.Endpoint, bool) {
@@ -94,6 +115,20 @@ func (d *Discoverer) ElastiCacheEndpoints(clusterId string) []common.Endpoint {
 	d.endpointsLock.RLock()
 	defer d.endpointsLock.RUnlock()
 	return d.ecEndpoints[clusterId]
+}
+
+// ElastiCacheRequiresTLS reports whether the cache only accepts TLS connections (ElastiCache Serverless).
+func (d *Discoverer) ElastiCacheRequiresTLS(id string) bool {
+	d.endpointsLock.RLock()
+	defer d.endpointsLock.RUnlock()
+	return d.ecTLS[id]
+}
+
+// MemoryDBEndpoints returns the endpoints of the nodes of the MemoryDB cluster and whether TLS is enabled.
+func (d *Discoverer) MemoryDBEndpoints(name string) ([]common.Endpoint, bool) {
+	d.endpointsLock.RLock()
+	defer d.endpointsLock.RUnlock()
+	return d.memoryDBEndpoints[name], d.memoryDBTLS[name]
 }
 
 func (d *Discoverer) publishEndpoints() {
@@ -125,11 +160,57 @@ func (d *Discoverer) publishEndpoints() {
 			Port: strconv.Itoa(int(aws.ToInt32(node.Endpoint.Port))),
 		})
 	}
+	ecTLS := map[string]bool{}
+	for _, c := range d.ecServerlessCollectors {
+		_, cache := c.snapshot()
+		if cache == nil || cache.Endpoint == nil {
+			continue
+		}
+		name := aws.ToString(cache.ServerlessCacheName) // `elasticache: <name>`, as for the clusters
+		ec[name] = append(ec[name], common.Endpoint{
+			Host: aws.ToString(cache.Endpoint.Address),
+			Port: strconv.Itoa(int(aws.ToInt32(cache.Endpoint.Port))),
+		})
+		ecTLS[name] = true
+	}
+	mdb := map[string][]common.Endpoint{}
+	mdbTLS := map[string]bool{}
+	for _, c := range d.memoryDBCollectors {
+		_, cluster := c.snapshot()
+		if cluster == nil {
+			continue
+		}
+		name := aws.ToString(cluster.Name)
+		mdb[name] = memoryDBEndpoints(cluster)
+		mdbTLS[name] = aws.ToBool(cluster.TLSEnabled)
+	}
 	d.endpointsLock.Lock()
 	d.rdsEndpoints = rds
 	d.rdsReplicas = replicas
 	d.ecEndpoints = ec
+	d.ecTLS = ecTLS
+	d.memoryDBEndpoints = mdb
+	d.memoryDBTLS = mdbTLS
 	d.endpointsLock.Unlock()
+}
+
+// buildCloudWatchQueries returns the CloudWatch metrics of the discovered resources for the CloudWatch goroutine.
+func (d *Discoverer) buildCloudWatchQueries() []cwQuery {
+	var res []cwQuery
+	for id, c := range d.rdsCollectors {
+		_, instance, _, _ := c.snapshot()
+		if !isAurora(instance) {
+			continue
+		}
+		info, known := d.auroraInstance(id)
+		res = append(res, auroraQueries(id, aws.ToString(instance.DBInstanceIdentifier), aws.ToString(instance.DBInstanceClass), info, known)...)
+	}
+	for id, c := range d.ecServerlessCollectors {
+		if _, cache := c.snapshot(); cache != nil {
+			res = append(res, serverlessCacheQueries(id, aws.ToString(cache.ServerlessCacheName))...)
+		}
+	}
+	return res
 }
 
 func NewDiscoverer(cfg *config.AWSConfig, k8s *k8s.K8S, reg prometheus.Registerer) (*Discoverer, error) {
@@ -142,11 +223,18 @@ func NewDiscoverer(cfg *config.AWSConfig, k8s *k8s.K8S, reg prometheus.Registere
 		stop:   make(chan struct{}),
 		done:   make(chan struct{}),
 
-		errors: map[string]bool{},
+		errors:     map[string]bool{},
+		deniedAPIs: map[string]bool{},
 
 		rdsCollectors: map[string]*RDSCollector{},
 		ecCollectors:  map[string]*ECCollector{},
 		ecTags:        newTagCache(ecTagsTTL),
+
+		ecServerlessCollectors: map[string]*ECServerlessCollector{},
+		memoryDBCollectors:     map[string]*MemoryDBCollector{},
+		cloudwatch:             newCloudWatchCache(),
+		cwKick:                 make(chan struct{}, 1),
+		cwDone:                 make(chan struct{}),
 	}
 	if err := d.setConfig(cfg); err != nil {
 		cancel()
@@ -158,6 +246,7 @@ func NewDiscoverer(cfg *config.AWSConfig, k8s *k8s.K8S, reg prometheus.Registere
 	}
 
 	go d.run(d.discover)
+	go d.cloudWatchLoop()
 	return d, nil
 }
 
@@ -188,6 +277,8 @@ func (d *Discoverer) setConfig(cfg *config.AWSConfig) error {
 	rdsClient := rds.NewFromConfig(awsCfg)
 	elasticacheClient := elasticache.NewFromConfig(awsCfg)
 	cloudwatchLogsClient := cloudwatchlogs.NewFromConfig(awsCfg)
+	cloudwatchClient := cloudwatch.NewFromConfig(awsCfg)
+	memorydbClient := memorydb.NewFromConfig(awsCfg)
 
 	d.lock.Lock()
 	defer d.lock.Unlock()
@@ -198,6 +289,8 @@ func (d *Discoverer) setConfig(cfg *config.AWSConfig) error {
 	d.rdsClient = rdsClient
 	d.elasticacheClient = elasticacheClient
 	d.cloudwatchLogsClient = cloudwatchLogsClient
+	d.cloudwatchClient = cloudwatchClient
+	d.memorydbClient = memorydbClient
 	return nil
 }
 
@@ -224,6 +317,18 @@ func (d *Discoverer) ElastiCacheClient() *elasticache.Client {
 	return d.elasticacheClient
 }
 
+func (d *Discoverer) CloudWatchClient() *cloudwatch.Client {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+	return d.cloudwatchClient
+}
+
+func (d *Discoverer) MemoryDBClient() *memorydb.Client {
+	d.lock.RLock()
+	defer d.lock.RUnlock()
+	return d.memorydbClient
+}
+
 func (d *Discoverer) CloudWatchLogsClient() *cloudwatchlogs.Client {
 	d.lock.RLock()
 	defer d.lock.RUnlock()
@@ -236,6 +341,9 @@ func (d *Discoverer) Stop() {
 		d.cancel()
 		close(d.stop)
 		<-d.done
+		if d.cwDone != nil {
+			<-d.cwDone
+		}
 		for id, c := range d.rdsCollectors {
 			prometheus.WrapRegistererWith(rdsLabels(id), d.reg).Unregister(c)
 			c.Stop()
@@ -243,6 +351,12 @@ func (d *Discoverer) Stop() {
 		for id, c := range d.ecCollectors {
 			prometheus.WrapRegistererWith(ecLabels(id), d.reg).Unregister(c)
 			c.Stop()
+		}
+		for id, c := range d.ecServerlessCollectors {
+			prometheus.WrapRegistererWith(ecServerlessLabels(id), d.reg).Unregister(c)
+		}
+		for id, c := range d.memoryDBCollectors {
+			prometheus.WrapRegistererWith(memoryDBLabels(id), d.reg).Unregister(c)
 		}
 		d.reg.Unregister(d)
 	})
@@ -282,6 +396,39 @@ func (d *Discoverer) registerError(err error) {
 	d.errorsLock.Unlock()
 }
 
+// registerOptionalAPIError handles an error of an API needed only by the optional integrations (Aurora cluster info,
+// ElastiCache Serverless, MemoryDB, CloudWatch metrics): if the IAM policy doesn't allow the call (e.g. it hasn't been
+// updated since these integrations were added), it's reported once instead of failing every discovery cycle.
+func (d *Discoverer) registerOptionalAPIError(action string, err error) {
+	if d.ctx.Err() != nil { // stopped
+		return
+	}
+	if isAccessDenied(err) {
+		d.errorsLock.Lock()
+		reported := d.deniedAPIs[action]
+		if d.deniedAPIs == nil {
+			d.deniedAPIs = map[string]bool{}
+		}
+		d.deniedAPIs[action] = true
+		d.errorsLock.Unlock()
+		if !reported {
+			klog.Warningf("AWS integration: %s is not allowed by the IAM policy, the related resources/metrics are skipped: %s", action, err)
+		}
+		return
+	}
+	klog.Error(err)
+	d.registerError(err)
+}
+
+func isAccessDenied(err error) bool {
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	code := apiErr.ErrorCode()
+	return strings.Contains(code, "AccessDenied") || strings.Contains(code, "UnauthorizedOperation") || strings.Contains(code, "NotAuthorized")
+}
+
 func (d *Discoverer) discover() {
 	d.errorsLock.Lock()
 	d.errors = map[string]bool{}
@@ -298,16 +445,21 @@ func (d *Discoverer) discover() {
 	}
 	cfg, region := d.config()
 	d.discoverRDS(cfg, region, d.RDSClient())
+	d.discoverAurora(region, d.RDSClient())
 	d.discoverEC(cfg, region, d.ElastiCacheClient())
+	d.discoverECServerless(cfg, region, d.ElastiCacheClient())
+	d.discoverMemoryDB(cfg, region, d.MemoryDBClient())
 	if d.ctx.Err() != nil { // stopped
 		return
 	}
 	d.publishEndpoints()
+	d.setCloudWatchQueries(d.buildCloudWatchQueries())
 
 	d.errorsLock.RLock()
 	errs := maps.Keys(d.errors)
 	d.errorsLock.RUnlock()
-	summary := fmt.Sprintf("AWS discovery (region=%s): %d RDS instances, %d ElastiCache nodes", region, len(d.rdsCollectors), len(d.ecCollectors))
+	summary := fmt.Sprintf("AWS discovery (region=%s): %d RDS instances, %d ElastiCache nodes, %d ElastiCache Serverless caches, %d MemoryDB clusters",
+		region, len(d.rdsCollectors), len(d.ecCollectors), len(d.ecServerlessCollectors), len(d.memoryDBCollectors))
 	switch {
 	case len(errs) > 0:
 		klog.Errorf("%s, errors: %s", summary, strings.Join(errs, "; "))
@@ -427,7 +579,11 @@ func (d *Discoverer) discoverEC(cfg *config.AWSConfig, region string, svc *elast
 	}
 }
 
-func (d *Discoverer) elastiCacheTags(svc *elasticache.Client, arn string) (map[string]string, error) {
+type elastiCacheTagsAPI interface {
+	ListTagsForResource(context.Context, *elasticache.ListTagsForResourceInput, ...func(*elasticache.Options)) (*elasticache.ListTagsForResourceOutput, error)
+}
+
+func (d *Discoverer) elastiCacheTags(svc elastiCacheTagsAPI, arn string) (map[string]string, error) {
 	if tags, ok := d.ecTags.get(arn); ok {
 		return tags, nil
 	}
